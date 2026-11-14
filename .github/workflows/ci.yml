@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: lint and test (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - name: Install
+        run: pip install -r requirements-dev.txt
+      - name: Lint
+        run: ruff check .
+      - name: Test (fake providers and mocked HTTP; no API keys, no LLM calls)
+        run: pytest
+
+  docker:
+    name: docker build and smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Validate the compose file
+        run: docker compose config --quiet
+      - name: Build the image
+        run: docker build -t llm-gateway:ci .
+      - name: Smoke-test the gateway with fake providers
+        run: |
+          docker run -d --name gateway -p 8000:8000 -e GATEWAY_FAKE_PROVIDERS=1 llm-gateway:ci
+          for i in $(seq 1 30); do curl -sf http://127.0.0.1:8000/health && break; sleep 1; done
+          curl -sf http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/json' \
+            -d '{"model": "auto", "messages": [{"role": "user", "content": "Say hello"}]}'
+      - name: Smoke-test the dashboard in the same image
+        run: |
+          docker run -d --name dashboard -p 8501:8501 llm-gateway:ci \
+            streamlit run dashboard/app.py --server.address=0.0.0.0 --server.port=8501 --server.headless=true
+          for i in $(seq 1 30); do curl -sf http://127.0.0.1:8501/_stcore/health && break; sleep 1; done
+          curl -sf http://127.0.0.1:8501/_stcore/health
+      - name: Container logs
+        if: always()
+        run: |
+          docker logs gateway || true
+          docker logs dashboard || true

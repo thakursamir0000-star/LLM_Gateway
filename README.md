@@ -1,3 +1,317 @@
 # LLM Gateway
 
-An OpenAI-compatible gateway that picks a model for each request with a trained router and records every call. Work in progress.
+An OpenAI-compatible service that sits between your apps and LLM providers. For each request it picks a model with a
+trained router (cheap model when it is likely good enough, strong model when it is not), and it records and monitors
+every call: tokens, cost, latency, errors, route decisions and user feedback.
+
+An app switches to it by changing one URL:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="unused-without-gateway-keys")
+reply = client.chat.completions.create(model="auto", messages=[{"role": "user", "content": "What is 17 * 23?"}])
+print(reply.choices[0].message.content)
+print(reply.model_extra["gateway"])  # which model answered, why, and what it cost
+```
+
+**Status:** phase 1. The gateway, routing, monitoring, release management and packaging are built and tested (171
+tests, all with fake providers or mocked HTTP). The router has **not been trained or evaluated yet**: that needs
+real API calls on the free tier and is the next step. See [Results](#results).
+
+## What it does
+
+- **OpenAI-compatible API**: `POST /v1/chat/completions` (with `stream: true`), `GET /v1/models`, plus
+  `POST /v1/feedback` for thumbs up/down. Errors use OpenAI's error format.
+- **Providers**: Groq (`openai/gpt-oss-20b` as the cheap model, `openai/gpt-oss-120b` as the strong one) and the Gemini
+  API (Gemini and Gemma models). Calls are paced under each model's free-tier limits and retried within bounds.
+- **Routing modes**, chosen per request with the `model` field:
+  `cheap`, `strong`, `router` (trained classifier, or a rule-based baseline) and `cascade` (cheap first, escalate when
+  the answer looks unsure). `auto` uses the configured default.
+- **One cost/quality knob**: a threshold in `[0, 1]`. Higher sends more traffic to the strong model.
+- **Monitoring**: every request is logged to SQLite (model, route decision, tokens, cost, latency, error; never the
+  prompt or the answer). A Streamlit dashboard shows requests, cost per day, p50/p95 latency, error rate and the share
+  per model. Alerts fire when the error rate or daily cost passes a limit.
+- **Release management**: model and prompt versions live in the config as releases; activate, roll back, or canary a
+  share of traffic to a new release. Per-app daily budgets.
+- **Router lab**: scripts to collect benchmark labels (GSM8K, MMLU) from both models, train the router, and compare it
+  with always-cheap, always-strong and random routing on held-out questions.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    App["App<br/>(OpenAI SDK)"] -->|"POST /v1/chat/completions"| API["FastAPI<br/>gateway/app.py"]
+    API --> Svc["Gateway service<br/>gateway/service.py"]
+    Svc --> Budget["Budget check<br/>per app, per UTC day"]
+    Svc --> Rel["Release + canary<br/>models + prompt version"]
+    Svc --> Router["Router<br/>rules | classifier"]
+    Svc --> Reg["Model registry<br/>pacing, retries"]
+    Reg --> Groq["Groq<br/>gpt-oss-20b / 120b"]
+    Reg --> Gemini["Gemini API<br/>Gemini / Gemma"]
+    Svc --> Check["Cascade check<br/>escalate if unsure"]
+    Svc --> DB[("SQLite<br/>requests, calls, feedback,<br/>deployments, alerts")]
+    Svc --> Alerts["Alerts<br/>log + webhook"]
+    DB --> Dash["Streamlit dashboard"]
+    Lab["Router lab scripts"] -->|"answers.jsonl"| Train["train_router.py"] -->|"models/router.json"| Router
+```
+
+What happens to one request (`gateway/service.py`):
+
+1. **Validate**: text chat, `n=1`, no tools (not supported yet).
+2. **Mode** from `model`: `auto`, `router`, `cascade`, `cheap`, `strong`, or a configured model (pinned, no routing).
+3. **Budget**: at the app's daily limit the request gets HTTP 429; past the soft limit (80% by default) routed
+   requests go to the cheap model.
+4. **Release**: the active release, or the canary for its share of traffic (sticky per `user` when it is set). The
+   release's prompt version is put before the app's messages.
+5. **Route**: the router scores P(cheap model is good enough); `score >= threshold` goes cheap, otherwise strong.
+6. **Call** through the registry: default params, pacing under per-minute limits, bounded retries. If the model fails,
+   the other tier is tried (`fallback_on_error`).
+7. **Cascade**: the cheap answer gets a heuristic confidence (empty, truncated, blocked, looping or hedged answers
+   score low); below the threshold the request is escalated to the strong model.
+8. **Log** one row per request and one per provider call; check alerts (at most once a minute).
+
+The response is a normal `chat.completion` with an extra `gateway` object (request id, release, canary, mode, router,
+score, threshold, tier, model, escalation, fallback, cost, router time, reason) and `x-gateway-*` headers. `usage`
+counts every provider call the request made (a cascade escalation pays for two).
+
+## Quick start
+
+Python 3.11+.
+
+```bash
+python -m venv .venv
+```
+
+```bash
+source .venv/bin/activate     # Windows: .venv\Scripts\activate
+```
+
+```bash
+pip install -r requirements-dev.txt
+```
+
+**Without API keys** (fake models, nothing leaves your machine):
+
+```bash
+GATEWAY_FAKE_PROVIDERS=1 python -m gateway
+```
+
+```bash
+python scripts/send_demo_traffic.py --n 300
+```
+
+```bash
+streamlit run dashboard/app.py
+```
+
+**With real models**: copy `.env.example` to `.env`, set `GROQ_API_KEY` (and `GEMINI_API_KEY` for Gemini/Gemma),
+then `python -m gateway`. The gateway listens on `http://127.0.0.1:8000` (`GATEWAY_HOST`, `GATEWAY_PORT`).
+
+```bash
+curl http://127.0.0.1:8000/v1/chat/completions -H "Content-Type: application/json" -H "X-App-Id: my-app" -d '{"model": "auto", "messages": [{"role": "user", "content": "Explain step by step why the sky is blue."}]}'
+```
+
+**Docker** (gateway on :8000, dashboard on :8501, sharing the request log in a volume):
+
+```bash
+docker compose up --build
+```
+
+`WITH_EMBEDDINGS=true docker compose up --build` adds sentence-transformers (CPU torch) so the trained router can run
+in the container; without it the gateway uses the rule-based router.
+
+## Routing
+
+| `model` value | What happens |
+|---|---|
+| `auto` | the configured `routing.default_mode` (`router` in the shipped config) |
+| `router` | the router's score against the threshold picks cheap or strong |
+| `cascade` | cheap model first; escalate to strong when the answer check is below the threshold |
+| `cheap` / `strong` | always that tier of the active (or canary) release |
+| `gpt-oss-120b`, `openai/gpt-oss-120b`, ... | a configured model, pinned: no routing, no fallback |
+
+**The threshold** (`routing.threshold`, per request with the `X-Gateway-Threshold` header) is the single knob. Every
+router outputs P(cheap model is good enough); requests with a score below the threshold go to the strong model. In
+cascade mode, cheap answers whose confidence is below the threshold are escalated. `0` = always cheap, `1` = (almost)
+always strong.
+
+**Rule-based router** (`gateway/routing/rules.py`): hand-weighted signals of a hard request (long context, code,
+maths, multi-step reasoning words, several questions, a long conversation). It is the baseline the trained router has
+to beat.
+
+**Classifier router** (`gateway/routing/classifier.py`): a sentence embedding of the last user message
+(`sentence-transformers/all-MiniLM-L6-v2` by default) followed by logistic regression that predicts whether the cheap
+model is good enough. The regression is fitted in numpy with Newton's method (a test checks it matches scikit-learn),
+so serving it needs no scikit-learn. It is loaded from `models/router.json`; until that file exists, the gateway falls
+back to the rules and says so in `/health`.
+
+**Cascade check** (`gateway/routing/cascade.py`): no extra model call, but it only catches answers that *look* wrong;
+a confident wrong answer passes. The evaluation measures how much that matters.
+
+## Releases, canary and rollback
+
+A release pins the cheap model, the strong model and the prompt version (`config/gateway.yaml`):
+
+```yaml
+releases:
+  v1:       {cheap: gpt-oss-20b, strong: gpt-oss-120b, prompt: passthrough@1}
+  v2-gemma: {cheap: gemma-4-31b, strong: gpt-oss-120b, prompt: concise@1}
+deployment:
+  active: v1
+  canary: null
+```
+
+Changes are appended to a deployment log in the database, from the CLI or the admin API:
+
+```bash
+python -m gateway.manage canary v2-gemma 0.1 --note "try Gemma as the cheap model"
+```
+
+```bash
+python -m gateway.manage activate v2-gemma
+```
+
+```bash
+python -m gateway.manage rollback
+```
+
+```bash
+python -m gateway.manage history
+```
+
+Rollback re-activates the release that was active before the current one and stops any canary. The dashboard compares
+stable and canary traffic (requests, error rate, p50 latency, cost, thumbs up/down). The admin endpoints
+(`/admin/status`, `/admin/activate`, `/admin/rollback`, `/admin/canary`, `/admin/deployments`, `/admin/alerts`) are off
+unless `GATEWAY_ADMIN_KEY` is set, and then need it in the `X-Admin-Key` header.
+
+## Budgets, feedback and alerts
+
+- **Budgets**: `budgets.default_daily_usd` and per-app `budgets.apps.<app>.daily_usd` (USD per UTC day, from the list
+  prices in the config). An app is identified by its bearer key when `GATEWAY_API_KEYS="app:key,..."` is set, otherwise
+  by the `X-App-Id` header. A request's cost is known only after it runs, so an app can overshoot by the requests in
+  flight.
+- **Feedback**: `POST /v1/feedback {"request_id": "<response id>", "score": "up" | "down" | 1 | -1, "comment": "..."}`.
+- **Alerts**: error rate over the last `window_minutes` (with at least `min_requests`) above `alerts.error_rate`, or
+  today's cost above `alerts.daily_cost_usd`. Each alert is logged, stored (the dashboard shows it), and POSTed as JSON
+  to `ALERT_WEBHOOK_URL` when set; it fires at most once per window (error rate) or per day (cost).
+
+## Router lab: data, training, evaluation
+
+The router is trained on which questions the cheap model gets right. The scripts are ready but **have not been run
+against real APIs**: they use your keys and free quota.
+
+```bash
+pip install -r requirements-lab.txt
+```
+
+1. **Questions** (no API calls): samples 400 GSM8K and 800 MMLU test questions and fixes a 75/25 train/test split
+   before any model sees them. It refuses to overwrite the file, so the split can't change after answers exist.
+
+   ```bash
+   python scripts/prepare_questions.py
+   ```
+
+2. **Labels** (spends API quota): runs the cheap and the strong model on every question and grades the answers.
+   Calls are paced under the per-minute limits in the config; every answer is appended to
+   `router_data/answers.jsonl` the moment it arrives; rerunning skips everything already answered. It stops at a
+   daily quota, a key problem or five errors in a row, and asks before spending quota (`--yes` skips the question).
+
+   ```bash
+   python scripts/collect_labels.py --dry-run
+   ```
+
+   ```bash
+   python scripts/collect_labels.py --limit 20
+   ```
+
+   ```bash
+   python scripts/collect_labels.py --yes
+   ```
+
+   Groq's free tier allows `openai/gpt-oss-120b` 8,000 tokens per minute and 200,000 per day, so the full set takes
+   several daily runs.
+
+3. **Train** (no API calls; downloads the embedder once). Label: the cheap model is good enough when it is right, or
+   when the strong model is wrong too. Regularisation is chosen by stratified 5-fold cross-validation.
+
+   ```bash
+   python scripts/train_router.py
+   ```
+
+4. **Evaluate** (no API calls): replays the held-out answers for always-cheap, always-strong, random routing (same
+   share sent to strong as the router), the rules, the classifier and the cascade. It reports accuracy, cost per 1,000
+   requests at list prices, the share sent to the strong model, the router's added latency, and the cheapest threshold
+   within 1 percentage point of always-strong accuracy, and draws `results/cost_vs_accuracy.png`.
+
+   ```bash
+   python scripts/evaluate_router.py
+   ```
+
+## Results
+
+**Pending.** No router has been trained and no evaluation has been run, so there are no accuracy, cost-saving or
+latency numbers yet. They will come from `scripts/evaluate_router.py` on the held-out questions once the labels are
+collected, and will be reported here with the chart, including where the router does not beat the baselines.
+
+## API
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /v1/chat/completions` | OpenAI chat completions (`stream` supported: the answer arrives as server-sent events once the model is done) |
+| `GET /v1/models` | routing modes and configured models |
+| `POST /v1/feedback` | thumbs up/down for a request id |
+| `GET /health` | status, active release, canary, router in use |
+| `/admin/*` | status, activate, rollback, canary (needs `GATEWAY_ADMIN_KEY`) |
+
+Request headers: `X-App-Id` (app name, when no gateway keys are configured), `X-Gateway-Threshold` (per-request
+threshold). Response headers: `x-gateway-request-id`, `x-gateway-model`, `x-gateway-tier`, `x-gateway-release`,
+`x-gateway-cost-usd`.
+
+## Configuration
+
+Everything is in [`config/gateway.yaml`](config/gateway.yaml), validated at startup (unknown keys and broken references
+are errors): models with prices and per-minute limits, providers, prompt versions, releases, routing, retries, budgets,
+alerts, auth and storage. Environment variables are listed in [`.env.example`](.env.example). Groq prices are on-demand
+list prices and change; check them before quoting costs. The Gemini API models have no price set (free tier), so their
+cost shows as 0.
+
+## Development
+
+```bash
+pytest
+```
+
+```bash
+ruff check .
+```
+
+The tests never call a real API: providers are fakes, and the Groq and Gemini adapters are tested against httpx mock
+transports. One test drives the gateway with the OpenAI SDK by changing only `base_url`; another renders the dashboard
+headless with Streamlit's `AppTest`. CI (`.github/workflows/ci.yml`) runs lint and tests on Python 3.11 and 3.12,
+builds the Docker image, and smoke-tests the gateway and the dashboard containers with fake providers.
+
+```
+gateway/            the service
+  app.py            FastAPI app and endpoints
+  service.py        the request pipeline
+  config.py         config schema and loading
+  providers/        Groq and Gemini adapters, fake provider, model registry (pacing, retries)
+  routing/          rules, embeddings, logistic regression, classifier, cascade check
+  monitoring/       SQLite store, metrics, alerts
+  manage/           releases (activate, rollback, canary), budgets, CLI
+dashboard/app.py    Streamlit dashboard
+router_lab/         questions and grading, resumable collection, labels, evaluation
+scripts/            prepare_questions, collect_labels, train_router, evaluate_router, send_demo_traffic
+config/gateway.yaml configuration
+tests/              pytest suite
+```
+
+## Limitations and next steps
+
+- Router results are pending (above). The rule weights are hand-set, and the cascade check is a heuristic.
+- `stream: true` returns the answer as SSE after the model finishes; there is no token-by-token streaming yet.
+- Text chat only: tools / function calling, images and `n > 1` are rejected with a clear 400.
+- SQLite fits one gateway instance; several instances would need a shared database (e.g. Postgres) and shared rate
+  limits.
+- Costs are list-price estimates from the config, not provider invoices.
