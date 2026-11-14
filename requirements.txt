@@ -1,0 +1,10 @@
+# Gateway service and dashboard
+fastapi>=0.110,<1
+uvicorn[standard]>=0.29
+httpx>=0.27,<1
+pydantic>=2.6,<3
+pyyaml>=6.0
+python-dotenv>=1.0
+numpy>=1.26
+pandas>=2.2
+streamlit>=1.38

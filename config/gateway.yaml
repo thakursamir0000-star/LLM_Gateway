@@ -1,0 +1,122 @@
+# LLM Gateway configuration.
+# Paths are relative to the project root. Environment overrides:
+#   GATEWAY_CONFIG  another config file
+#   GATEWAY_DB      the SQLite request log (storage.db_path)
+
+# ── Models ──────────────────────────────────────────────────────────
+# Each alias names one provider model. Prices are USD per 1M tokens and are
+# used for cost tracking, budgets and the router evaluation.
+# Groq prices are on-demand list prices; check https://groq.com/pricing before
+# quoting costs. The Gemini API models run on the free tier here, so no price
+# is set (cost shows as 0): set a list price to compare them on cost.
+# `limits` are client-side pacing under free-tier limits (0 = off).
+models:
+  gpt-oss-20b:
+    provider: groq
+    model: openai/gpt-oss-20b
+    price_per_1m: {input: 0.10, output: 0.50}
+    limits: {rpm: 30, tpm: 8000}
+    params: {reasoning_effort: low}
+  gpt-oss-120b:
+    provider: groq
+    model: openai/gpt-oss-120b
+    price_per_1m: {input: 0.15, output: 0.75}
+    limits: {rpm: 30, tpm: 8000}
+    params: {reasoning_effort: low}
+  gemini-4-hydrogen:
+    provider: gemini
+    model: gemini-4-hydrogen
+    limits: {rpm: 10}       # free tier also allows only 20 requests per day
+  gemma-4-31b:
+    provider: gemini
+    model: gemma-4-31b-it
+    limits: {rpm: 10}
+
+providers:
+  groq:
+    base_url: https://api.groq.com/openai/v1
+    api_key_env: GROQ_API_KEY
+    timeout_s: 60
+  gemini:
+    base_url: https://generativelanguage.googleapis.com/v1beta
+    api_key_env: GEMINI_API_KEY
+    timeout_s: 120
+
+# ── Prompts ─────────────────────────────────────────────────────────
+# Versioned system prompts, named <name>@<version>. A release's prompt is put
+# before the app's own messages; an empty prompt adds nothing.
+prompts:
+  passthrough@1: ""
+  concise@1: "You are a helpful assistant. Answer accurately and concisely."
+
+# ── Releases ────────────────────────────────────────────────────────
+# A release pins the cheap model, the strong model and the prompt version.
+# Activate, roll back or canary them with `python -m gateway.manage` or the
+# /admin endpoints; every change is kept in the database's deployment log.
+releases:
+  v1:
+    cheap: gpt-oss-20b
+    strong: gpt-oss-120b
+    prompt: passthrough@1
+    note: Groq gpt-oss pair the router is trained for
+  v2-gemma:
+    cheap: gemma-4-31b
+    strong: gpt-oss-120b
+    prompt: concise@1
+    note: candidate - Gemma on the Gemini API as the cheap model
+
+# Starting state; the deployment log in the database takes over after the
+# first activate / rollback / canary change.
+deployment:
+  active: v1
+  canary: null            # e.g. {release: v2-gemma, share: 0.1}
+
+# ── Routing ─────────────────────────────────────────────────────────
+# Modes: cheap | strong | router | cascade. A request picks one with its
+# `model` field ("auto" = default_mode).
+# threshold: the one cost/quality knob. Router: send to the cheap model when
+# P(cheap model is good enough) >= threshold. Cascade: escalate to the strong
+# model when the cheap answer's confidence < threshold. Higher = more quality,
+# more cost. Override per request with the X-Gateway-Threshold header.
+routing:
+  default_mode: router
+  router: classifier      # rules | classifier (falls back to rules until a model is trained)
+  classifier_path: models/router.json
+  threshold: 0.5
+  fallback_on_error: true # if the chosen model fails, try the other tier
+
+retries:
+  attempts: 3
+  max_wait_s: 10          # longest the gateway holds a request for a rate limit
+
+# ── Budgets ─────────────────────────────────────────────────────────
+# Daily USD limit per app (UTC day). Over the soft limit, router/cascade/strong
+# requests go to the cheap model; at the limit, requests get HTTP 429.
+budgets:
+  default_daily_usd: 1.0
+  soft_limit_fraction: 0.8
+  apps:
+    demo: {daily_usd: 0.20}
+
+# ── Alerts ──────────────────────────────────────────────────────────
+# Checked at most every check_interval_s; logged, stored, and POSTed as JSON
+# to the URL in $ALERT_WEBHOOK_URL when it is set.
+alerts:
+  error_rate: 0.2         # share of failed requests in the window
+  window_minutes: 15
+  min_requests: 20        # fewer requests in the window: no error-rate alert
+  daily_cost_usd: 5.0
+  check_interval_s: 60
+  webhook_env: ALERT_WEBHOOK_URL
+
+# ── Auth ────────────────────────────────────────────────────────────
+# $GATEWAY_API_KEYS="app1:key1,app2:key2" turns on bearer-key auth (the key
+# names the app). Unset: the app comes from the X-App-Id header ("default").
+# Admin endpoints need $GATEWAY_ADMIN_KEY in the X-Admin-Key header; unset,
+# they are off (the CLI still works).
+auth:
+  keys_env: GATEWAY_API_KEYS
+  admin_key_env: GATEWAY_ADMIN_KEY
+
+storage:
+  db_path: var/gateway.db

@@ -1,0 +1,6 @@
+# Router lab: benchmark questions, sentence embeddings, eval chart.
+# Install on top of requirements.txt to prepare data, train and evaluate the router:
+#   pip install -r requirements-lab.txt
+datasets>=2.18
+sentence-transformers>=3.0
+matplotlib>=3.8
