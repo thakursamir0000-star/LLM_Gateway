@@ -29,6 +29,7 @@ from gateway.config import load_config
 from gateway.routing import RulesRouter
 from gateway.routing.cascade import check_answer
 from gateway.routing.classifier import ClassifierRouter
+from router_lab import safe_console
 from router_lab.dataset import build_pairs
 from router_lab.evaluate import (
     cascade_confidences,
@@ -51,6 +52,7 @@ MIN_ITEMS = 10
 
 
 def main() -> int:
+    safe_console()
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--questions", default=str(ROOT / "router_data" / "questions.jsonl"))
     parser.add_argument("--answers", default=str(ROOT / "router_data" / "answers.jsonl"))

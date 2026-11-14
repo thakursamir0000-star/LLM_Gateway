@@ -31,12 +31,14 @@ from dotenv import load_dotenv
 
 from gateway.config import load_config
 from gateway.providers import ModelRegistry, build_providers
+from router_lab import safe_console
 from router_lab.collect import collect
 from router_lab.progress import AnswerLog
 from router_lab.questions import format_prompt, load_questions
 
 
 def main() -> int:
+    safe_console()
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--questions", default=str(ROOT / "router_data" / "questions.jsonl"))
     parser.add_argument("--answers", default=str(ROOT / "router_data" / "answers.jsonl"))

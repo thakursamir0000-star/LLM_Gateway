@@ -291,3 +291,9 @@ def test_registry_without_pacing_ignores_model_limits(config):
                              pacing=False)
     for _ in range(3):
         run(registry.complete("small", USER, {}))
+
+
+def test_registry_records_the_model_time_of_the_successful_call(config):
+    registry = ModelRegistry(config, {"groq": FakeProvider("groq", latency_s=0.02), "gemini": FakeProvider()})
+    completion = run(registry.complete("small", USER, {}))
+    assert completion.latency_ms is not None and completion.latency_ms >= 5

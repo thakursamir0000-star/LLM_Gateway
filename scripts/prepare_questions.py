@@ -21,10 +21,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from router_lab import safe_console
 from router_lab.questions import from_gsm8k, from_mmlu, sample_and_split, save_questions
 
 
 def main() -> int:
+    safe_console()
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--gsm8k", type=int, default=400, help="GSM8K questions (maths word problems)")
     parser.add_argument("--mmlu", type=int, default=800, help="MMLU questions (57 subjects, multiple choice)")

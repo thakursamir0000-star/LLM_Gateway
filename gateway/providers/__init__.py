@@ -79,8 +79,10 @@ class ModelRegistry:
                 reservation = await limiter.acquire(estimate, max_wait=self.max_wait, sleep=self._sleep)
             except RateLimited as e:
                 raise ProviderError(str(e), kind=RATE_LIMIT, status=429, retry_after=e.wait_s) from e
+            started = time.perf_counter()
             try:
                 completion = await provider.complete(spec.model, messages, merged)
+                completion.latency_ms = round((time.perf_counter() - started) * 1000, 1)
             except ProviderError as e:
                 limiter.settle(reservation, 0)
                 if e.kind not in RETRYABLE or attempt == self.attempts:

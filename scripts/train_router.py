@@ -26,6 +26,7 @@ from gateway.config import load_config
 from gateway.routing.classifier import ClassifierRouter
 from gateway.routing.embeddings import load_embedder
 from gateway.routing.logistic import cross_validate, fit_logistic, predict_proba, roc_auc
+from router_lab import safe_console
 from router_lab.dataset import build_pairs
 from router_lab.progress import AnswerLog
 from router_lab.questions import load_questions
@@ -35,6 +36,7 @@ MIN_PAIRS = 30
 
 
 def main() -> int:
+    safe_console()
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--questions", default=str(ROOT / "router_data" / "questions.jsonl"))
     parser.add_argument("--answers", default=str(ROOT / "router_data" / "answers.jsonl"))

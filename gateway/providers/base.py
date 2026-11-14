@@ -28,6 +28,7 @@ class Completion:
     prompt_tokens: int = 0
     completion_tokens: int = 0  # includes reasoning ("thinking") tokens, which are billed as output
     model: str = ""  # provider model name
+    latency_ms: float | None = None  # the successful provider call only (no pacing waits or retries)
 
 
 class ProviderError(Exception):

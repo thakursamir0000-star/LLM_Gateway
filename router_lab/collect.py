@@ -66,10 +66,13 @@ async def collect(questions: list[Question], models: list[str], registry: ModelR
                 continue
             consecutive = 0
             correct, extracted = grade(q, completion.text)
+            total_ms = (time.perf_counter() - started) * 1000
+            model_ms = completion.latency_ms if completion.latency_ms is not None else total_ms
+            # latency_ms is the model's own time; wait_ms is local pacing and retry waits on top of it.
             record.update(correct=correct, extracted=extracted, gold=q.answer, text=completion.text,
                           finish_reason=completion.finish_reason, prompt_tokens=completion.prompt_tokens,
-                          completion_tokens=completion.completion_tokens,
-                          latency_ms=round((time.perf_counter() - started) * 1000, 1), error=None)
+                          completion_tokens=completion.completion_tokens, latency_ms=round(model_ms, 1),
+                          wait_ms=round(max(0.0, total_ms - model_ms), 1), error=None)
             log.append(record)
             summary.answered += 1
             position = summary.answered + summary.skipped + summary.errors

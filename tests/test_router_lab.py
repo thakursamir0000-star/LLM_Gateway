@@ -344,3 +344,10 @@ def test_prepare_keeps_an_existing_split(tmp_path, monkeypatch):
     existing.write_text("keep me")
     assert run_main(load_script("prepare_questions"), monkeypatch, ["--out", str(existing)]) == 1
     assert existing.read_text() == "keep me"
+
+
+def test_collect_separates_model_time_from_pacing_waits(tmp_path):
+    log = AnswerLog(tmp_path / "answers.jsonl")
+    run_collect([GSM], answer_twelve, log, models=("small",))
+    record = log.answers()[("gsm8k-0001", "small")]
+    assert record["latency_ms"] >= 0 and record["wait_ms"] >= 0
