@@ -15,7 +15,7 @@ print(reply.choices[0].message.content)
 print(reply.model_extra["gateway"])  # which model answered, why, and what it cost
 ```
 
-**Status:** phase 1. The gateway, routing, monitoring, release management and packaging are built and tested (171
+**Status:** phase 1. The gateway, routing, monitoring, release management and packaging are built and tested (173
 tests, all with fake providers or mocked HTTP). The router has **not been trained or evaluated yet**: that needs
 real API calls on the free tier and is the next step. See [Results](#results).
 
@@ -212,6 +212,8 @@ pip install -r requirements-lab.txt
    python scripts/prepare_questions.py
    ```
 
+   If the download stops asking for `hf_xet`, set `HF_HUB_DISABLE_XET=1` (plain HTTP downloads) and rerun.
+
 2. **Labels** (spends API quota): runs the cheap and the strong model on every question and grades the answers.
    Calls are paced under the per-minute limits in the config; every answer is appended to
    `router_data/answers.jsonl` the moment it arrives; rerunning skips everything already answered. It stops at a
@@ -229,8 +231,9 @@ pip install -r requirements-lab.txt
    python scripts/collect_labels.py --yes
    ```
 
-   Groq's free tier allows `openai/gpt-oss-120b` 8,000 tokens per minute and 200,000 per day, so the full set takes
-   several daily runs.
+   Groq's free tier allows `openai/gpt-oss-120b` 8,000 tokens per minute and 200,000 per day. In a 20-question pilot
+   a question took about 350-380 tokens per model (prompt plus answer, low reasoning effort), so all 1,200 questions
+   need roughly 0.45M tokens per model: about three days of gpt-oss-120b's daily quota.
 
 3. **Train** (no API calls; downloads the embedder once). Label: the cheap model is good enough when it is right, or
    when the strong model is wrong too. Regularisation is chosen by stratified 5-fold cross-validation.
@@ -253,6 +256,8 @@ pip install -r requirements-lab.txt
 **Pending.** No router has been trained and no evaluation has been run, so there are no accuracy, cost-saving or
 latency numbers yet. They will come from `scripts/evaluate_router.py` on the held-out questions once the labels are
 collected, and will be reported here with the chart, including where the router does not beat the baselines.
+Collected so far: a 20-question pilot (of 1,200) that checked the pipeline and the grader on real answers; it is far
+too small to compare the models.
 
 ## API
 
