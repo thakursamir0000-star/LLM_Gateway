@@ -74,24 +74,38 @@ def summary(store: Store, since: str | None = None, until: str | None = None,
     }
 
 
-def daily(store: Store, since: str | None = None, app_id: str | None = None) -> list[dict[str, Any]]:
-    """One row per UTC day: requests, errors, error rate, cost, p50/p95 latency."""
+_BUCKETS = {"day": "day", "hour": "substr(ts, 1, 13) || ':00'"}
+
+
+def timeseries(store: Store, since: str | None = None, app_id: str | None = None,
+               bucket: str = "day") -> list[dict[str, Any]]:
+    """One row per UTC day (or hour): requests, errors, error rate, cost, p50/p95 latency."""
+    key = _BUCKETS[bucket]
     where, params = _where(since, None, app_id)
     rows = store.query(
-        "SELECT day, COUNT(*) AS requests, COALESCE(SUM(status = 'error'), 0) AS errors, "
+        f"SELECT {key} AS bucket, COUNT(*) AS requests, COALESCE(SUM(status = 'error'), 0) AS errors, "
         "COALESCE(SUM(status = 'rejected'), 0) AS rejected, COALESCE(SUM(status = 'ok'), 0) AS ok, "
         "COALESCE(SUM(cost_usd), 0) AS cost_usd, COALESCE(SUM(prompt_tokens + completion_tokens), 0) AS tokens "
-        f"FROM requests{where} GROUP BY day ORDER BY day", params)
+        f"FROM requests{where} GROUP BY bucket ORDER BY bucket", params)
     latencies: dict[str, list[float]] = {}
-    for r in store.query(f"SELECT day, latency_ms FROM requests{where}{' AND' if where else ' WHERE'} "
+    for r in store.query(f"SELECT {key} AS bucket, latency_ms FROM requests{where}{' AND' if where else ' WHERE'} "
                          "status = 'ok' AND latency_ms IS NOT NULL", params):
-        latencies.setdefault(r["day"], []).append(r["latency_ms"])
+        latencies.setdefault(r["bucket"], []).append(r["latency_ms"])
     for row in rows:
         counted = row["ok"] + row["errors"]
         row["error_rate"] = row["errors"] / counted if counted else 0.0
-        row["p50_ms"] = percentile(latencies.get(row["day"], []), 50)
-        row["p95_ms"] = percentile(latencies.get(row["day"], []), 95)
+        row["p50_ms"] = percentile(latencies.get(row["bucket"], []), 50)
+        row["p95_ms"] = percentile(latencies.get(row["bucket"], []), 95)
     return rows
+
+
+def daily(store: Store, since: str | None = None, app_id: str | None = None) -> list[dict[str, Any]]:
+    """One row per UTC day (``day`` key): requests, errors, error rate, cost, p50/p95 latency."""
+    return [{"day": row.pop("bucket"), **row} for row in timeseries(store, since, app_id, "day")]
+
+
+def app_ids(store: Store) -> list[str]:
+    return [r["app_id"] for r in store.query("SELECT DISTINCT app_id FROM requests ORDER BY app_id")]
 
 
 def model_share(store: Store, since: str | None = None, app_id: str | None = None) -> list[dict[str, Any]]:

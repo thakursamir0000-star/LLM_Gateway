@@ -53,13 +53,14 @@ def build_providers(config: GatewayConfig, *, fake: bool = False) -> dict[str, P
 class ModelRegistry:
     def __init__(self, config: GatewayConfig, providers: dict[str, Provider], *, attempts: int | None = None,
                  max_wait: float | None = None, sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
-                 clock: Callable[[], float] = time.monotonic):
+                 clock: Callable[[], float] = time.monotonic, pacing: bool = True):
         self.config = config
         self.providers = providers
         self.attempts = attempts if attempts is not None else config.retries.attempts
         self.max_wait = max_wait if max_wait is not None else config.retries.max_wait_s
         self._sleep = sleep
-        self.limiters = {alias: RateLimiter(spec.limits.rpm, spec.limits.tpm, clock)
+        # pacing=False (fake providers) ignores the per-minute limits, which only matter for real APIs.
+        self.limiters = {alias: RateLimiter(spec.limits.rpm if pacing else 0, spec.limits.tpm if pacing else 0, clock)
                          for alias, spec in config.models.items()}
 
     def spec(self, alias: str) -> ModelSpec:

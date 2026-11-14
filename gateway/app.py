@@ -64,7 +64,7 @@ def create_app(config: GatewayConfig | None = None, *, providers: dict[str, Prov
         config = load_config()
     fake = providers is None and _truthy(os.environ.get("GATEWAY_FAKE_PROVIDERS"))
     providers = providers if providers is not None else build_providers(config, fake=fake)
-    registry = ModelRegistry(config, providers, **({"sleep": sleep} if sleep else {}))
+    registry = ModelRegistry(config, providers, pacing=not fake, **({"sleep": sleep} if sleep else {}))
     owns_store = store is None
     store = store if store is not None else Store(resolve_path(config.storage.db_path))
     router = router if router is not None else build_router(config)

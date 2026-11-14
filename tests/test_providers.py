@@ -281,3 +281,13 @@ def test_build_providers(config, monkeypatch):
     assert isinstance(providers["groq"], GroqProvider) and isinstance(providers["gemini"], GeminiProvider)
     fakes = build_providers(config, fake=True)
     assert all(isinstance(p, FakeProvider) for p in fakes.values())
+
+
+def test_registry_without_pacing_ignores_model_limits(config):
+    from tests.conftest import make_config
+
+    paced = make_config(models={"small": {"provider": "groq", "model": "m", "limits": {"rpm": 1}}})
+    registry = ModelRegistry(paced, {"groq": FakeProvider("groq"), "gemini": FakeProvider()}, max_wait=1,
+                             pacing=False)
+    for _ in range(3):
+        run(registry.complete("small", USER, {}))
