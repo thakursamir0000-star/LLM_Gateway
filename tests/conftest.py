@@ -31,7 +31,9 @@ BASE_CONFIG: dict[str, Any] = {
     "retries": {"attempts": 3, "max_wait_s": 10},
     "budgets": {"default_daily_usd": 1.0, "soft_limit_fraction": 0.8, "apps": {"tiny": {"daily_usd": 0.001}}},
     "alerts": {"error_rate": 0.5, "window_minutes": 15, "min_requests": 4, "daily_cost_usd": 0.01,
-               "check_interval_s": 0},
+               "check_interval_s": 0, "webhook_env": "TEST_ALERT_WEBHOOK"},
+    # Test-only variable names, so a developer's own GATEWAY_* settings can't change the tests.
+    "auth": {"keys_env": "TEST_GATEWAY_KEYS", "admin_key_env": "TEST_GATEWAY_ADMIN_KEY"},
 }
 
 
