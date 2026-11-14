@@ -14,7 +14,8 @@ from typing import Any
 from gateway.routing.base import RouteScore, routing_text, safe_text
 
 _CODE = re.compile(r"```|\bdef \w+\(|\bclass \w+|\bfunction\b|\bimport \w+|#include|\bSELECT\b.+\bFROM\b|"
-                   r"Traceback|\bstack trace\b|\bregex\b|\bcompile[sr]?\b|\bSQL\b|\bAPI\b", re.IGNORECASE)
+                   r"Traceback|\bstack trace\b|\bregex\b|\bcompile[sr]?\b|\bSQL\b|\bAPI\b|\bcode\b|\bpython\b|"
+                   r"\bjavascript\b|\btypescript\b", re.IGNORECASE)
 _MATH = re.compile(r"\d+\s*[-+*/^=<>]\s*\d+|\bintegral\b|\bderivative\b|\bprove\b|\btheorem\b|\bequations?\b|"
                    r"\bprobability\b|\bmatri(x|ces)\b|\beigen|\bsolve for\b|\blimit of\b|\bpercent(age)?\b",
                    re.IGNORECASE)
