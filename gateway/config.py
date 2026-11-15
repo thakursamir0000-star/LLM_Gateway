@@ -23,6 +23,8 @@ DEFAULT_CONFIG = ROOT / "config" / "gateway.yaml"
 Mode = Literal["cheap", "strong", "router", "cascade"]
 MODES: tuple[str, ...] = ("cheap", "strong", "router", "cascade")
 TIERS: tuple[str, ...] = ("cheap", "strong")
+LatencyClass = Literal["interactive", "batch"]
+LATENCY_CLASSES: tuple[str, ...] = ("interactive", "batch")
 
 
 class _Strict(BaseModel):
@@ -61,11 +63,29 @@ class ProviderSpec(_Strict):
     timeout_s: float = Field(60.0, gt=0)
 
 
+class TierModels(_Strict):
+    cheap: str
+    strong: str
+
+
 class Release(_Strict):
+    """The models and prompt version that serve traffic.
+
+    ``cheap``/``strong`` serve interactive traffic. ``batch`` can name other
+    models for latency-tolerant traffic (e.g. a slower, cheaper provider);
+    without it, batch traffic uses the same models.
+    """
+
     cheap: str
     strong: str
     prompt: str
+    batch: TierModels | None = None
     note: str = ""
+
+    def model_for(self, tier: str, latency: str = "interactive") -> str:
+        if latency == "batch" and self.batch is not None:
+            return getattr(self.batch, tier)
+        return getattr(self, tier)
 
 
 class Canary(_Strict):
@@ -89,6 +109,18 @@ class RoutingConfig(_Strict):
 class RetryConfig(_Strict):
     attempts: int = Field(3, ge=1)
     max_wait_s: float = Field(10.0, ge=0)
+    # After a quota error (daily limit, no credits) a model is skipped this long, or longer if the provider says so.
+    quota_cooldown_s: float = Field(300.0, ge=0)
+
+
+class LatencyConfig(_Strict):
+    """Which latency class a request is in when it doesn't say (X-Gateway-Latency)."""
+
+    default: LatencyClass = "interactive"
+    apps: dict[str, LatencyClass] = {}
+
+    def class_for(self, app_id: str, requested: str | None = None) -> str:
+        return requested or self.apps.get(app_id) or self.default
 
 
 class AppBudget(_Strict):
@@ -126,6 +158,7 @@ class GatewayConfig(_Strict):
     releases: dict[str, Release]
     deployment: Deployment
     routing: RoutingConfig = Field(default_factory=RoutingConfig)
+    latency: LatencyConfig = Field(default_factory=LatencyConfig)
     retries: RetryConfig = Field(default_factory=RetryConfig)
     budgets: BudgetConfig = Field(default_factory=BudgetConfig)
     alerts: AlertConfig = Field(default_factory=AlertConfig)
@@ -139,8 +172,11 @@ class GatewayConfig(_Strict):
                 raise ValueError(f"model {alias!r}: unknown provider {spec.provider!r}")
         for name, release in self.releases.items():
             for tier in TIERS:
-                if getattr(release, tier) not in self.models:
-                    raise ValueError(f"release {name!r}: unknown {tier} model {getattr(release, tier)!r}")
+                for latency in LATENCY_CLASSES:
+                    alias = release.model_for(tier, latency)
+                    if alias not in self.models:
+                        where = f"batch.{tier}" if latency == "batch" and release.batch else tier
+                        raise ValueError(f"release {name!r}: unknown {where} model {alias!r}")
             if release.prompt not in self.prompts:
                 raise ValueError(f"release {name!r}: unknown prompt {release.prompt!r}")
         if self.deployment.active not in self.releases:

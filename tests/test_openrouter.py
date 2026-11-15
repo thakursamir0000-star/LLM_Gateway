@@ -186,13 +186,13 @@ def test_gateway_logs_the_cost_openrouter_reports(tmp_path):
     assert store.query("SELECT cost_usd FROM calls")[0]["cost_usd"] == pytest.approx(0.00042)
 
 
-def test_shipped_config_has_openrouter_but_keeps_groq_active():
+def test_shipped_config_has_openrouter_and_keeps_the_groq_only_release():
     config = load_config(DEFAULT_CONFIG)
     assert config.providers["openrouter"].api_key_env == "OPENROUTER_API_KEY"
     assert config.providers["openrouter"].base_url == "https://openrouter.ai/api/v1"
     assert config.models["or-gpt-oss-20b"].provider == "openrouter"
     assert config.models["or-gpt-oss-120b"].model == "openai/gpt-oss-120b"
-    assert config.deployment.active == "v1" and config.releases["v1"].cheap == "gpt-oss-20b"
+    assert config.releases["v1"].cheap == "gpt-oss-20b" and config.releases["v1"].batch is None
 
 
 # ── separate, resumable answer files ────────────────────────────────

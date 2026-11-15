@@ -6,11 +6,15 @@
 3. Budget: refuse at the app's daily limit; past the soft limit use the cheap model.
 4. Release: the active one, or the canary for its share of traffic; its prompt
    version is put before the app's messages.
-5. Route: the router's score against the threshold picks cheap or strong;
-   cascade starts with cheap.
-6. Call the model (paced, retried); if it fails, optionally try the other tier.
-7. Cascade: check the cheap answer and escalate to strong when unsure.
-8. Log one row per request and one per provider call, then check alerts.
+5. Latency class: interactive or batch (X-Gateway-Latency header, else the
+   app's default, else the global one). A release can serve batch traffic with
+   other models, e.g. a slower, cheaper provider.
+6. Route: the router's score against the threshold picks cheap or strong;
+   cascade starts with cheap. The tier and the latency class pick the model.
+7. Call the model (paced, retried). If it fails, try the same tier on the other
+   latency class's model (another provider), then the other tier.
+8. Cascade: check the cheap answer and escalate to strong when unsure.
+9. Log one row per request and one per provider call, then check alerts.
 """
 
 from __future__ import annotations
@@ -94,6 +98,7 @@ def new_request_id() -> str:
 class RequestContext:
     app_id: str = "default"
     threshold: float | None = None  # per-request override (X-Gateway-Threshold)
+    latency: str | None = None  # per-request latency class (X-Gateway-Latency)
     request_id: str = field(default_factory=new_request_id)
 
 
@@ -238,7 +243,8 @@ class Gateway:
         messages = ([{"role": "system", "content": system_prompt}] if system_prompt else []) + app_messages
 
         threshold = self.config.routing.threshold if ctx.threshold is None else ctx.threshold
-        record.mode, record.threshold = ("pinned" if pinned else mode), threshold
+        latency = self.config.latency.class_for(ctx.app_id, ctx.latency)
+        record.mode, record.threshold, record.latency_class = ("pinned" if pinned else mode), threshold, latency
         if pinned:
             tier = "pinned"
         elif mode == "router":
@@ -250,23 +256,24 @@ class Gateway:
             tier = choose_tier(score.score, threshold)
         else:
             tier = "cheap" if mode == "cascade" else mode
-        alias = pinned or getattr(release, tier)
+        alias = pinned or release.model_for(tier, latency)
         params = request.params()
 
         allow_fallback = not pinned and (self.config.routing.fallback_on_error or mode == "cascade")
-        completion, tier, alias = await self._call_with_fallback(record, tier, alias, release, messages, params,
-                                                                 allow_fallback)
+        completion, tier, alias = await self._call_with_fallback(record, tier, alias, release, latency, messages,
+                                                                 params, allow_fallback)
         if record.fallback:
-            notes.append(f"fallback to {tier} after an error")
+            notes.append(f"fallback to {alias} ({tier}) after an error")
 
         if mode == "cascade" and not pinned and tier == "cheap":
             check = check_answer(routing_text(app_messages), completion.text, completion.finish_reason)
             record.calls[-1].confidence, record.calls[-1].check_reason = check.confidence, check.reason
             notes.append(f"cheap answer: {check.reason} ({check.confidence:.2f})")
             if should_escalate(check, threshold):
+                strong = release.model_for("strong", latency)
                 try:
-                    completion = await self._call(record, "strong", release.strong, messages, params)
-                    tier, alias, record.escalated = "strong", release.strong, True
+                    completion = await self._call(record, "strong", strong, messages, params)
+                    tier, alias, record.escalated = "strong", strong, True
                 except ProviderError as e:
                     notes.append(f"escalation failed ({e.kind}); kept the cheap answer")
 
@@ -277,25 +284,40 @@ class Gateway:
         gateway_info = {
             "request_id": record.id, "app_id": record.app_id, "release": record.release, "canary": record.canary,
             "prompt_version": record.prompt_version, "mode": record.mode, "router": record.router,
-            "route_score": record.route_score, "threshold": threshold, "tier": tier, "model": alias,
+            "route_score": record.route_score, "threshold": threshold, "latency_class": latency, "tier": tier,
+            "model": alias,
             "escalated": record.escalated, "fallback": record.fallback, "cost_usd": round(record.cost_usd, 8),
             "router_ms": record.router_ms, "reason": record.route_reason,
         }
         return ChatResult(record.id, int(now.timestamp()), provider_model, completion.text, completion.finish_reason,
                           record.prompt_tokens, record.completion_tokens, gateway_info)
 
+    @staticmethod
+    def fallback_chain(tier: str, alias: str, release: Release, latency: str) -> list[tuple[str, str]]:
+        """(tier, model) to try in order: the chosen model, the same tier for the other latency
+        class (another provider, same quality), then the other tier."""
+        other_class = "batch" if latency == "interactive" else "interactive"
+        other_tier = "strong" if tier == "cheap" else "cheap"
+        chain = [(tier, alias), (tier, release.model_for(tier, other_class)),
+                 (other_tier, release.model_for(other_tier, latency))]
+        unique: list[tuple[str, str]] = []
+        for step in chain:
+            if step[1] not in [a for _, a in unique]:
+                unique.append(step)
+        return unique
+
     async def _call_with_fallback(self, record: RequestRecord, tier: str, alias: str, release: Release,
-                                  messages: list[dict[str, Any]], params: dict[str, Any],
+                                  latency: str, messages: list[dict[str, Any]], params: dict[str, Any],
                                   allow_fallback: bool) -> tuple[Completion, str, str]:
-        try:
-            return await self._call(record, tier, alias, messages, params), tier, alias
-        except ProviderError as e:
-            if not allow_fallback or e.kind == BAD_REQUEST:
-                raise
-            other = "strong" if tier == "cheap" else "cheap"
-            record.fallback = True
-            completion = await self._call(record, other, getattr(release, other), messages, params)
-            return completion, other, getattr(release, other)
+        chain = self.fallback_chain(tier, alias, release, latency) if allow_fallback else [(tier, alias)]
+        for i, (step_tier, step_alias) in enumerate(chain):
+            try:
+                return await self._call(record, step_tier, step_alias, messages, params), step_tier, step_alias
+            except ProviderError as e:
+                if e.kind == BAD_REQUEST or i == len(chain) - 1:
+                    raise
+                record.fallback = True
+        raise AssertionError("unreachable")  # pragma: no cover
 
     async def _call(self, record: RequestRecord, tier: str, alias: str, messages: list[dict[str, Any]],
                     params: dict[str, Any]) -> Completion:

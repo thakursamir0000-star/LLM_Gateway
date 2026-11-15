@@ -96,11 +96,19 @@ releases:
     strong: or-gpt-oss-120b
     prompt: passthrough@1
     note: candidate - the same gpt-oss pair through OpenRouter (not active; compare first)
+  v4-latency:
+    cheap: gpt-oss-20b
+    strong: gpt-oss-120b
+    batch: {cheap: or-gpt-oss-20b, strong: or-gpt-oss-120b}
+    prompt: passthrough@1
+    note: >-
+      interactive traffic on Groq (p50 0.7 s for 120b), batch traffic on OpenRouter's DeepInfra host
+      (3.6x cheaper, slower); measured on 377 questions, see the README's provider comparison
 
 # Starting state; the deployment log in the database takes over after the
 # first activate / rollback / canary change.
 deployment:
-  active: v1
+  active: v4-latency      # roll back to v1 (Groq only) with: python -m gateway.manage activate v1
   canary: null            # e.g. {release: v2-gemma, share: 0.1}
 
 # ── Routing ─────────────────────────────────────────────────────────
@@ -110,16 +118,30 @@ deployment:
 # P(cheap model is good enough) >= threshold. Cascade: escalate to the strong
 # model when the cheap answer's confidence < threshold. Higher = more quality,
 # more cost. Override per request with the X-Gateway-Threshold header.
+# default_mode is strong: on the measured questions the strong model was the
+# better buy (on OpenRouter it costs 17% more than the cheap one), and the
+# provider is chosen by latency class instead (below). The rule router stays
+# available with model="router".
 routing:
-  default_mode: router
+  default_mode: strong
   router: classifier      # rules | classifier (falls back to rules until a model is trained)
   classifier_path: models/router.json
   threshold: 0.5
-  fallback_on_error: true # if the chosen model fails, try the other tier
+  fallback_on_error: true # if the chosen model fails: same tier on the other provider, then the other tier
+
+# ── Latency classes ─────────────────────────────────────────────────
+# interactive | batch. A request sets it with the X-Gateway-Latency header;
+# otherwise the app's default here, otherwise `default`. A release's `batch`
+# models serve batch traffic (releases without them use the same models).
+latency:
+  default: interactive
+  apps:
+    batch: batch
 
 retries:
   attempts: 3
   max_wait_s: 10          # longest the gateway holds a request for a rate limit
+  quota_cooldown_s: 300   # skip a model this long after a quota error (daily limit, no credits)
 
 # ── Budgets ─────────────────────────────────────────────────────────
 # Daily USD limit per app (UTC day). Over the soft limit, router/cascade/strong

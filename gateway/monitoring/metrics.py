@@ -143,6 +143,26 @@ def release_stats(store: Store, since: str | None = None) -> list[dict[str, Any]
     return rows
 
 
+def latency_class_stats(store: Store, since: str | None = None, app_id: str | None = None) -> list[dict[str, Any]]:
+    """Per latency class: requests, error rate, fallbacks, cost and p50/p95 latency of successful requests."""
+    where, params = _where(since, None, app_id)
+    rows = store.query(
+        "SELECT COALESCE(latency_class, 'not recorded') AS latency_class, COUNT(*) AS requests, "
+        "COALESCE(SUM(status = 'ok'), 0) AS ok, COALESCE(SUM(status = 'error'), 0) AS errors, "
+        "COALESCE(SUM(fallback), 0) AS fallbacks, COALESCE(SUM(cost_usd), 0) AS cost_usd "
+        f"FROM requests{where} GROUP BY 1 ORDER BY 1", params)
+    for row in rows:
+        counted = row["ok"] + row["errors"]
+        row["error_rate"] = row["errors"] / counted if counted else 0.0
+        latencies = [r["latency_ms"] for r in store.query(
+            f"SELECT latency_ms FROM requests{where}{' AND' if where else ' WHERE'} "
+            "COALESCE(latency_class, 'not recorded') = ? AND status = 'ok' AND latency_ms IS NOT NULL",
+            [*params, row["latency_class"]])]
+        row["p50_ms"] = percentile(latencies, 50)
+        row["p95_ms"] = percentile(latencies, 95)
+    return rows
+
+
 def app_spend(store: Store, day: str) -> list[dict[str, Any]]:
     return store.query("SELECT app_id, COUNT(*) AS requests, COALESCE(SUM(cost_usd), 0) AS cost_usd "
                        "FROM requests WHERE day = ? GROUP BY app_id ORDER BY cost_usd DESC", (day,))
@@ -151,6 +171,7 @@ def app_spend(store: Store, day: str) -> list[dict[str, Any]]:
 def recent(store: Store, limit: int = 50, app_id: str | None = None) -> list[dict[str, Any]]:
     where, params = _where(None, None, app_id)
     return store.query(
-        "SELECT ts, id, app_id, release, canary, mode, router, route_score, tier, model, escalated, fallback, "
+        "SELECT ts, id, app_id, release, canary, mode, router, route_score, latency_class, tier, model, escalated, "
+        "fallback, "
         "prompt_tokens, completion_tokens, cost_usd, latency_ms, router_ms, status, http_status, error_type "
         f"FROM requests{where} ORDER BY ts DESC LIMIT ?", [*params, limit])

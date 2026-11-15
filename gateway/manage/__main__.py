@@ -23,6 +23,8 @@ def describe(manager: ReleaseManager) -> str:
     lines = [f"active:  {state.active}  (from {state.source}{', ' + state.ts if state.ts else ''})"]
     release = manager.config.releases[state.active]
     lines.append(f"         cheap={release.cheap} strong={release.strong} prompt={release.prompt}")
+    if release.batch:
+        lines.append(f"         batch: cheap={release.batch.cheap} strong={release.batch.strong}")
     if state.canary:
         canary = manager.config.releases[state.canary]
         lines.append(f"canary:  {state.canary} on {state.canary_share:.0%} of traffic")

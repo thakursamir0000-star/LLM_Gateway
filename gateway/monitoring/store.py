@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS requests (
     route_score REAL,
     route_reason TEXT,
     threshold REAL,
+    latency_class TEXT,
     tier TEXT,
     model TEXT,
     provider_model TEXT,
@@ -99,6 +100,9 @@ CREATE TABLE IF NOT EXISTS alerts (
 );
 """
 
+# Columns added after the first release, created on older databases at startup.
+MIGRATIONS = {"requests": {"latency_class": "TEXT"}}
+
 
 def utc_now() -> datetime:
     return datetime.now(UTC)
@@ -139,6 +143,7 @@ class RequestRecord:
     route_score: float | None = None
     route_reason: str | None = None
     threshold: float | None = None
+    latency_class: str | None = None  # interactive | batch
     tier: str | None = None
     model: str | None = None
     provider_model: str | None = None
@@ -174,7 +179,15 @@ class Store:
                 self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA busy_timeout=10000")
             self._conn.executescript(SCHEMA)
+            self._migrate()
             self._conn.commit()
+
+    def _migrate(self) -> None:
+        for table, columns in MIGRATIONS.items():
+            existing = {row[1] for row in self._conn.execute(f"PRAGMA table_info({table})")}
+            for column, kind in columns.items():
+                if column not in existing:
+                    self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
 
     def close(self) -> None:
         with self._lock:

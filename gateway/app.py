@@ -24,7 +24,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from gateway import __version__
-from gateway.config import ROOT, GatewayConfig, load_config, resolve_path
+from gateway.config import LATENCY_CLASSES, ROOT, GatewayConfig, load_config, resolve_path
 from gateway.manage.budgets import BudgetPolicy
 from gateway.manage.releases import ReleaseError, ReleaseManager
 from gateway.monitoring import metrics
@@ -135,10 +135,20 @@ def create_app(config: GatewayConfig | None = None, *, providers: dict[str, Prov
             raise GatewayError(400, "X-Gateway-Threshold must be a number from 0 to 1", param="X-Gateway-Threshold")
         return value
 
+    def latency_for(request: Request) -> str | None:
+        raw = request.headers.get("x-gateway-latency")
+        if raw is None:
+            return None
+        value = raw.strip().lower()
+        if value not in LATENCY_CLASSES:
+            raise GatewayError(400, "X-Gateway-Latency must be 'interactive' or 'batch'", param="X-Gateway-Latency")
+        return value
+
     # ── OpenAI-compatible API ───────────────────────────────────────
     @app.post("/v1/chat/completions")
     async def chat_completions(body: ChatRequest, request: Request):
-        ctx = RequestContext(app_id=app_id_for(request), threshold=threshold_for(request))
+        ctx = RequestContext(app_id=app_id_for(request), threshold=threshold_for(request),
+                             latency=latency_for(request))
         result = await gateway.chat(body, ctx)
         if not body.stream:
             return JSONResponse(result.to_openai(), headers=result.headers())
@@ -173,7 +183,8 @@ def create_app(config: GatewayConfig | None = None, *, providers: dict[str, Prov
         state = releases.state()
         return {"status": "ok", "version": __version__, "release": state.active, "canary": state.canary,
                 "canary_share": state.canary_share, "default_mode": config.routing.default_mode,
-                "threshold": config.routing.threshold, "router": router.description, "fake_providers": fake,
+                "threshold": config.routing.threshold, "latency_default": config.latency.default,
+                "router": router.description, "fake_providers": fake,
                 "auth": "api_keys" if api_keys else "x-app-id"}
 
     # ── admin ───────────────────────────────────────────────────────

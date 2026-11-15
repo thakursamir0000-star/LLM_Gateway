@@ -68,9 +68,10 @@ release = config.releases[state.active]
 canary = f" · canary **{state.canary}** on {state.canary_share:.0%} of traffic" if state.canary else " · no canary"
 router_file = resolve_path(config.routing.classifier_path)
 router = config.routing.router if config.routing.router == "rules" or router_file.exists() else "rules (no trained model)"
-st.markdown(f"Release **{state.active}** (cheap `{release.cheap}`, strong `{release.strong}`, prompt "
+batch = (f"; batch: cheap `{release.batch.cheap}`, strong `{release.batch.strong}`" if release.batch else "")
+st.markdown(f"Release **{state.active}** (cheap `{release.cheap}`, strong `{release.strong}`{batch}, prompt "
             f"`{release.prompt}`){canary} · mode `{config.routing.default_mode}` · router `{router}` · "
-            f"threshold {config.routing.threshold:.2f}")
+            f"threshold {config.routing.threshold:.2f} · default latency class `{config.latency.default}`")
 
 for alert in evaluate(store, config.alerts, now):
     st.error(f"**Alert ({alert.kind.replace('_', ' ')}):** {alert.message}", icon="⚠️")
@@ -179,6 +180,19 @@ with right:
                      column_config={"error_rate": st.column_config.NumberColumn("error rate", format="percent"),
                                     "p50_ms": st.column_config.NumberColumn("p50 ms", format="%.0f"),
                                     "cost_usd": st.column_config.NumberColumn("cost", format="$%.5f")})
+
+st.subheader("By latency class")
+classes = pd.DataFrame(metrics.latency_class_stats(store, since=since, app_id=app_id))
+if not classes.empty:
+    st.dataframe(classes[["latency_class", "requests", "error_rate", "fallbacks", "p50_ms", "p95_ms", "cost_usd"]],
+                 hide_index=True, use_container_width=True,
+                 column_config={"latency_class": "latency class",
+                                "error_rate": st.column_config.NumberColumn("error rate", format="percent"),
+                                "p50_ms": st.column_config.NumberColumn("p50 ms", format="%.0f"),
+                                "p95_ms": st.column_config.NumberColumn("p95 ms", format="%.0f"),
+                                "cost_usd": st.column_config.NumberColumn("cost", format="$%.5f")})
+    st.caption("Interactive requests go to the release's fast models, batch requests to its batch models "
+               "(X-Gateway-Latency header, or the app's default in the config).")
 
 st.subheader("Spend today (UTC) against budgets")
 policy = BudgetPolicy(config.budgets)
