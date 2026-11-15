@@ -278,8 +278,31 @@ latency numbers yet. They will come from `scripts/evaluate_router.py` on the hel
 collected, and will be reported here with the chart, including where the router does not beat the baselines.
 Collected so far: 377 of 1,200 questions (2026-11-15, stopped at Groq's daily token limit). A preliminary pass of
 training and evaluation on them ran end to end, but is too small to report: only 23 training questions needed the
-strong model. An OpenRouter pilot on 10 of those questions checked the second provider end to end; 10 questions are
-too few to compare accuracy.
+strong model.
+
+### Provider comparison (measured 2026-11-15)
+
+The same open-weight models on Groq and on OpenRouter (pinned to its DeepInfra bf16 host), on the 377 identical
+GSM8K + MMLU questions, low reasoning effort. Full table: [`results/provider_comparison.md`](results/provider_comparison.md).
+
+| Model | Accuracy (95% CI) | Cost per 1,000 questions | Latency p50 / p95 |
+|---|---|---|---|
+| Groq gpt-oss-20b | 83.6% (79-87%) | $0.052 | 0.57 / 0.91 s |
+| Groq gpt-oss-120b | 87.3% (84-90%) | $0.107 | 0.69 / 1.12 s |
+| OpenRouter gpt-oss-20b | 84.4% (80-88%) | $0.025 | 1.41 / 3.37 s |
+| OpenRouter gpt-oss-120b | 88.6% (85-91%) | $0.030 | 4.34 / 15.48 s |
+
+- The host made no measurable difference to accuracy (same model, Groq vs OpenRouter: exact McNemar p = 0.75 for 20b,
+  0.38 for 120b).
+- 120b beat 20b on OpenRouter (p = 0.011); on Groq the gap was borderline (p = 0.059).
+- OpenRouter's 120b was both more accurate than Groq's 20b (p = 0.005) and 43% cheaper, but its latency was 6-14x
+  higher, with a long tail.
+- On OpenRouter 120b costs only 17% more than 20b, so cheap/strong routing there can save little; the larger trade-off
+  is latency against cost, across providers.
+
+Costs are list prices (OpenRouter's reported cost matched them on every call); Groq ran on its free tier. Latency was
+measured from one machine on one day; Groq latency excludes 20 early answers recorded with local pacing waits. Two
+OpenRouter calls hit the host's rate limit and succeeded on a rerun.
 
 ## API
 

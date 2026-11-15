@@ -9,7 +9,8 @@ Written by the router lab scripts (see the main README, "Train and evaluate the 
 - `answers_openrouter.jsonl`: the same gpt-oss models through OpenRouter (pinned to the DeepInfra bf16 host), on
   questions both Groq models answered, kept separate from the Groq file. Each record also has `provider`,
   `served_by` (the host), `cost_usd` (list-price estimate) and `provider_cost_usd` (the cost OpenRouter reported).
-  So far: a 10-question pilot (2026-11-15).
+  Complete for the 377 questions both Groq models answered (2026-11-15: a 10-question pilot, then the rest; total
+  reported cost $0.0207).
 
 Commit both once collected: the answers cost days of free-tier quota, and the
 evaluation and training are reproducible from them without any API calls.
