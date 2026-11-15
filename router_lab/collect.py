@@ -4,7 +4,8 @@ Calls go through the gateway's ModelRegistry, so they get the model's default
 params, pacing under its per-minute limits and bounded retries. Every answer
 is saved as soon as it arrives. The run stops early when retrying can't help:
 a daily quota is used up, the API key is missing or rejected, or several
-calls in a row failed.
+calls in a row failed. With a Budget (router_lab.budget) it also stops before
+any request that could take spending past the cap, and on unexpected billing.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ from typing import Any
 
 from gateway.providers import ModelRegistry
 from gateway.providers.base import AUTH, QUOTA_EXHAUSTED, ProviderError, redact
+from router_lab.budget import Budget, worst_case_cost
 from router_lab.progress import AnswerLog
 from router_lab.questions import Question, grade, messages_for
 
@@ -27,17 +29,19 @@ class CollectSummary:
     skipped: int = 0  # already in the answer log
     errors: int = 0
     stopped: str | None = None  # why the run stopped early (None = finished)
+    spent_usd: float = 0.0  # this run's spend (reported cost, else list-price estimate)
 
 
 async def collect(questions: list[Question], models: list[str], registry: ModelRegistry, log: AnswerLog, *,
                   params: dict[str, Any] | None = None, max_consecutive_errors: int = 5,
-                  report: Callable[[str], None] = print) -> CollectSummary:
+                  budget: Budget | None = None, report: Callable[[str], None] = print) -> CollectSummary:
     with log.lock():  # one writer per answer file, so no duplicate records
-        return await _collect(questions, models, registry, log, params or {}, max_consecutive_errors, report)
+        return await _collect(questions, models, registry, log, params or {}, max_consecutive_errors, budget,
+                              report)
 
 
 async def _collect(questions: list[Question], models: list[str], registry: ModelRegistry, log: AnswerLog,
-                   params: dict[str, Any], max_consecutive_errors: int,
+                   params: dict[str, Any], max_consecutive_errors: int, budget: Budget | None,
                    report: Callable[[str], None]) -> CollectSummary:
     summary = CollectSummary()
     done = log.answers()
@@ -48,11 +52,19 @@ async def _collect(questions: list[Question], models: list[str], registry: Model
             if (q.id, alias) in done:
                 summary.skipped += 1
                 continue
-            started = time.perf_counter()
             spec = registry.spec(alias)
+            if budget is not None:
+                worst = worst_case_cost(spec, messages_for(q), params)
+                if not budget.allows(worst):
+                    summary.stopped = (f"budget: the next call could cost up to ${worst:.6f} and only "
+                                       f"${budget.remaining_usd:.6f} of ${budget.limit_usd:.4f} is left")
+                    return summary
+            started = time.perf_counter()
             record: dict[str, Any] = {"question_id": q.id, "split": q.split, "source": q.source, "model": alias,
                                       "provider": spec.provider, "provider_model": spec.model,
                                       "ts": datetime.now(UTC).isoformat(timespec="seconds")}
+            if budget is not None and budget.tag:
+                record["budget_tag"] = budget.tag
             try:
                 completion = await registry.complete(alias, messages_for(q), params)
             except ProviderError as e:
@@ -86,8 +98,18 @@ async def _collect(questions: list[Question], models: list[str], registry: Model
                           cost_usd=round(spec.cost(completion.prompt_tokens, completion.completion_tokens), 10),
                           provider_cost_usd=completion.provider_cost_usd, served_by=completion.served_by,
                           error=None)
-            log.append(record)
+            log.append(record)  # saved before any budget decision, so a paid answer is never lost
             summary.answered += 1
+            if budget is not None:
+                cost, unexpected = budget.charge(spec, completion)
+                summary.spent_usd += cost
+                if unexpected:
+                    summary.stopped = (f"unexpected billing: {q.id} {alias} was reported at "
+                                       f"${completion.provider_cost_usd:.6f}, above the list-price estimate "
+                                       f"${record['cost_usd']:.6f}")
+                    return summary
+            else:
+                summary.spent_usd += completion.provider_cost_usd if completion.provider_cost_usd is not None                     else record["cost_usd"]
             position = summary.answered + summary.skipped + summary.errors
             report(f"[{position}/{total}] {q.id} {alias}: {'right' if correct else 'wrong'} "
                    f"({completion.prompt_tokens}+{completion.completion_tokens} tokens)")

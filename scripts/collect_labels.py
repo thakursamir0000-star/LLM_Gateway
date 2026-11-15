@@ -18,6 +18,13 @@ On Groq's free tier openai/gpt-oss-120b allows 8,000 tokens per minute and
 Another provider's models go in their own answer file, on the same questions:
 
     python scripts/collect_labels.py --cheap or-gpt-oss-20b --strong or-gpt-oss-120b         --answers router_data/answers_openrouter.jsonl --only-answered-in router_data/answers.jsonl         --sample 10 --env-file "D:/New folder/Agentai/.env" --yes
+
+Paid providers can run under a spending cap. --max-cost-usd never starts a
+request that could take spending past the cap (worst case: the whole output
+token cap), and stops on unexpected billing. --budget-tag ties runs together:
+a resumed run with the same tag counts what the earlier runs spent.
+
+    python scripts/collect_labels.py ... --max-cost-usd 0.05 --budget-tag or-remaining --yes
 """
 
 from __future__ import annotations
@@ -37,9 +44,10 @@ from dotenv import load_dotenv
 from gateway.config import load_config
 from gateway.providers import ModelRegistry, build_providers
 from router_lab import safe_console
+from router_lab.budget import Budget, record_cost, spent_with_tag, worst_case_cost
 from router_lab.collect import collect
 from router_lab.progress import AnswerLog, AnswerLogLocked
-from router_lab.questions import format_prompt, load_questions, sample
+from router_lab.questions import format_prompt, load_questions, messages_for, sample
 
 
 def main() -> int:
@@ -58,6 +66,10 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=0, help="seed for --sample")
     parser.add_argument("--env-file", help="also read API keys from this .env file (never printed)")
     parser.add_argument("--max-tokens", type=int, default=2048, help="output token cap per answer")
+    parser.add_argument("--max-cost-usd", type=float,
+                        help="spending cap for this budget (reported cost, else list-price estimate)")
+    parser.add_argument("--budget-tag",
+                        help="name of the budget; earlier runs with the same tag count toward --max-cost-usd")
     parser.add_argument("--dry-run", action="store_true", help="show what would run; no API calls")
     parser.add_argument("--yes", action="store_true", help="don't ask before spending API quota")
     args = parser.parse_args()
@@ -95,6 +107,28 @@ def main() -> int:
         print(f"model {alias}: {spec.provider} {spec.model}, limits rpm={spec.limits.rpm} tpm={spec.limits.tpm}, "
               f"params {spec.params}, API key {key}")
     print(f"answers file: {args.answers} ({len(done)} answers saved, {todo} calls to go)")
+
+    # Expected cost: each model's mean cost per question source so far; worst case: the guard's per-call bound.
+    params = {"max_completion_tokens": args.max_tokens}
+    costs: dict[tuple[str, str], list[float]] = {}
+    for (_, alias), answer in done.items():
+        costs.setdefault((alias, answer.get("source", "?")), []).append(record_cost(answer))
+    expected = worst = 0.0
+    for q in questions:
+        for alias in models:
+            if (q.id, alias) not in done:
+                bound = worst_case_cost(config.models[alias], messages_for(q), params)
+                seen = costs.get((alias, q.source))
+                worst += bound
+                expected += sum(seen) / len(seen) if seen else bound
+    print(f"estimated cost of the remaining calls: ${expected:.4f} expected (from the answers so far), "
+          f"${worst:.4f} if every call used its whole {args.max_tokens}-token output cap")
+    budget = None
+    if args.max_cost_usd is not None:
+        budget = Budget(args.max_cost_usd, spent_with_tag(log.records(), args.budget_tag), args.budget_tag)
+        tag = f"tag {args.budget_tag!r}" if args.budget_tag else "no tag: only this run counts"
+        print(f"budget: ${budget.limit_usd:.4f}, already spent ${budget.spent_usd:.6f} ({tag}), "
+              f"${budget.remaining_usd:.6f} left")
     if args.dry_run:
         if questions:
             print("\nsample prompt:\n" + format_prompt(questions[0]))
@@ -112,7 +146,7 @@ def main() -> int:
     async def run():
         registry = ModelRegistry(config, build_providers(config), attempts=6, max_wait=180)
         try:
-            return await collect(questions, models, registry, log, params={"max_completion_tokens": args.max_tokens})
+            return await collect(questions, models, registry, log, params=params, budget=budget)
         finally:
             await registry.aclose()
 
@@ -122,7 +156,10 @@ def main() -> int:
         print(f"error: {e}", file=sys.stderr)
         return 1
     answers = log.answers()
-    print(f"\nanswered {summary.answered}, already done {summary.skipped}, errors {summary.errors}")
+    print(f"\nanswered {summary.answered}, already done {summary.skipped}, errors {summary.errors}, "
+          f"spent this run ${summary.spent_usd:.6f}")
+    if budget is not None:
+        print(f"budget: ${budget.spent_usd:.6f} of ${budget.limit_usd:.4f} spent, ${budget.remaining_usd:.6f} left")
     for alias in models:
         mine = [a for (qid, m), a in answers.items() if m == alias]
         if mine:
