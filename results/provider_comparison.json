@@ -142,17 +142,59 @@
   }
  ],
  "agreement": {
+  "gpt-oss-20b vs gpt-oss-120b (same provider)": {
+   "n": 377,
+   "both_right": 298,
+   "both_wrong": 31,
+   "only_first": 17,
+   "only_second": 31,
+   "same_answer": 324,
+   "mcnemar_p": 0.05946337525377032
+  },
   "gpt-oss-20b vs or-gpt-oss-20b (same model, different provider)": {
+   "n": 377,
    "both_right": 297,
    "both_wrong": 41,
-   "only_gpt-oss-20b": 18,
-   "only_or-gpt-oss-20b": 21
+   "only_first": 18,
+   "only_second": 21,
+   "same_answer": 331,
+   "mcnemar_p": 0.7492586247608415
+  },
+  "gpt-oss-20b vs or-gpt-oss-120b (different model and provider)": {
+   "n": 377,
+   "both_right": 303,
+   "both_wrong": 31,
+   "only_first": 12,
+   "only_second": 31,
+   "same_answer": 329,
+   "mcnemar_p": 0.005401572654591291
+  },
+  "gpt-oss-120b vs or-gpt-oss-20b (different model and provider)": {
+   "n": 377,
+   "both_right": 307,
+   "both_wrong": 37,
+   "only_first": 22,
+   "only_second": 11,
+   "same_answer": 335,
+   "mcnemar_p": 0.08014331245794892
   },
   "gpt-oss-120b vs or-gpt-oss-120b (same model, different provider)": {
+   "n": 377,
    "both_right": 321,
    "both_wrong": 35,
-   "only_gpt-oss-120b": 8,
-   "only_or-gpt-oss-120b": 13
+   "only_first": 8,
+   "only_second": 13,
+   "same_answer": 353,
+   "mcnemar_p": 0.38331031799316406
+  },
+  "or-gpt-oss-20b vs or-gpt-oss-120b (same provider)": {
+   "n": 377,
+   "both_right": 308,
+   "both_wrong": 33,
+   "only_first": 10,
+   "only_second": 26,
+   "same_answer": 335,
+   "mcnemar_p": 0.011330984183587134
   }
  }
 }

@@ -309,8 +309,23 @@ def test_comparison_uses_common_questions_and_clean_latency():
     assert openrouter.cost_per_1k_reported == pytest.approx(0.02) and groq.cost_per_1k_reported is None
     assert groq.cost_per_1k_estimated == pytest.approx((100 * 0.10 + 100 * 0.50) / 1e6 * 1000)
     assert (openrouter.failures, openrouter.rate_limited, openrouter.calls) == (1, 1, 4)
-    assert agreement(answers, "small", "or-small", common) == {"both_right": 1, "both_wrong": 0, "only_small": 0,
-                                                                "only_or-small": 1}
+    pair = agreement(answers, "small", "or-small", common)
+    assert {k: pair[k] for k in ("n", "both_right", "both_wrong", "only_first", "only_second")} == {
+        "n": 2, "both_right": 1, "both_wrong": 0, "only_first": 0, "only_second": 1}
+    assert pair["mcnemar_p"] == 1.0
+
+
+def test_mcnemar_and_same_answer_counts():
+    from router_lab.compare import mcnemar_exact
+
+    assert mcnemar_exact(0, 0) == 1.0
+    assert mcnemar_exact(8, 13) == pytest.approx(0.383, abs=1e-3)
+    assert mcnemar_exact(12, 31) == pytest.approx(0.005, abs=1e-3)
+    answers = {("q1", "a"): {"correct": True, "extracted": "4"}, ("q1", "b"): {"correct": True, "extracted": "4"},
+               ("q2", "a"): {"correct": False, "extracted": "7"}, ("q2", "b"): {"correct": False, "extracted": "9"},
+               ("q3", "a"): {"correct": False, "extracted": None}, ("q3", "b"): {"correct": False, "extracted": None}}
+    pair = agreement(answers, "a", "b", {"q1", "q2", "q3"})
+    assert pair["same_answer"] == 1 and pair["both_wrong"] == 2  # two different wrong answers are not "the same"
 
 
 def test_compare_script(tmp_path, monkeypatch, capsys):

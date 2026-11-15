@@ -134,14 +134,29 @@ def model_stats(model: str, answers: dict[tuple[str, str], dict[str, Any]], reco
     )
 
 
+def mcnemar_exact(only_first: int, only_second: int) -> float:
+    """Two-sided exact McNemar p-value from the discordant counts (a binomial test at 0.5)."""
+    n = only_first + only_second
+    if n == 0:
+        return 1.0
+    k = min(only_first, only_second)
+    return min(1.0, 2 * sum(math.comb(n, i) for i in range(k + 1)) / 2 ** n)
+
+
 def agreement(answers: dict[tuple[str, str], dict[str, Any]], a: str, b: str,
-              question_ids: set[str]) -> dict[str, int]:
-    """How often two models (e.g. one model on two hosts) are right on the same questions."""
-    out = {"both_right": 0, "both_wrong": 0, f"only_{a}": 0, f"only_{b}": 0}
+              question_ids: set[str]) -> dict[str, Any]:
+    """How two models compare question by question: right/wrong together, the same final answer,
+    and whether the accuracy difference is significant (exact McNemar test)."""
+    out: dict[str, Any] = {"n": len(question_ids), "both_right": 0, "both_wrong": 0, "only_first": 0,
+                           "only_second": 0, "same_answer": 0}
     for qid in question_ids:
-        ra, rb = bool(answers[(qid, a)].get("correct")), bool(answers[(qid, b)].get("correct"))
-        key = "both_right" if ra and rb else "both_wrong" if not ra and not rb else f"only_{a}" if ra else f"only_{b}"
+        first, second = answers[(qid, a)], answers[(qid, b)]
+        ra, rb = bool(first.get("correct")), bool(second.get("correct"))
+        key = "both_right" if ra and rb else "both_wrong" if not ra and not rb else "only_first" if ra else "only_second"
         out[key] += 1
+        extracted = first.get("extracted")
+        out["same_answer"] += int(extracted is not None and extracted == second.get("extracted"))
+    out["mcnemar_p"] = mcnemar_exact(out["only_first"], out["only_second"])
     return out
 
 
@@ -149,7 +164,7 @@ def _ms(value: float | None) -> str:
     return "-" if value is None else f"{value:,.0f}"
 
 
-def markdown(stats: list[ModelStats], pairs: dict[str, dict[str, int]]) -> str:
+def markdown(stats: list[ModelStats], pairs: dict[str, dict[str, Any]]) -> str:
     n = stats[0].n if stats else 0
     lines = [
         f"Questions answered by every model: {n}.",
@@ -175,13 +190,20 @@ def markdown(stats: list[ModelStats], pairs: dict[str, dict[str, int]]) -> str:
             cells = [f"{s.by_source[src]['accuracy']:.1%} ({int(s.by_source[src]['n'])})" if src in s.by_source
                      else "-" for src in sources]
             lines.append(f"| {s.model} | " + " | ".join(cells) + " |")
-    for name, counts in pairs.items():
-        lines += ["", f"{name}: " + ", ".join(f"{k} {v}" for k, v in counts.items())]
+    if pairs:
+        lines += ["", "Question by question (first vs second model): right or wrong together, the same final answer, "
+                      "and the exact McNemar test of the accuracy difference.", "",
+                  "| Pair | Both right | Both wrong | Only first right | Only second right | Same final answer | "
+                  "McNemar p |", "|---|---|---|---|---|---|---|"]
+        for name, c in pairs.items():
+            lines.append(f"| {name} | {c['both_right']} | {c['both_wrong']} | {c['only_first']} | "
+                         f"{c['only_second']} | {c['same_answer']} ({c['same_answer'] / c['n']:.0%}) | "
+                         f"{c['mcnemar_p']:.3f} |")
     lines += ["", "Latency is the model's own time; answers saved before pacing waits were recorded separately "
                   "are left out of it (n shows how many count). Calls, failures and rate limits cover every call "
                   "the collection made for the model, after the registry's own retries."]
     return "\n".join(lines)
 
 
-def to_json(stats: list[ModelStats], pairs: dict[str, dict[str, int]]) -> dict[str, Any]:
+def to_json(stats: list[ModelStats], pairs: dict[str, dict[str, Any]]) -> dict[str, Any]:
     return {"models": [asdict(s) for s in stats], "agreement": pairs}

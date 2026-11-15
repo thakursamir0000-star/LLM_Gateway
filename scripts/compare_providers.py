@@ -5,8 +5,9 @@
 
 Reads router_data/answers.jsonl (Groq) and router_data/answers_openrouter.jsonl
 by default; each provider's answers stay in their own file. For every pair of
-aliases of the same provider model (e.g. Groq and OpenRouter gpt-oss-20b) it
-also counts the questions where only one of them was right.
+models it also counts the questions where both, neither or only one was
+right, how often they gave the same final answer, and the exact McNemar
+p-value of their accuracy difference.
 """
 
 from __future__ import annotations
@@ -58,9 +59,11 @@ def main() -> int:
     pairs = {}
     for i, a in enumerate(stats):
         for b in stats[i + 1:]:
-            if a.provider_model == b.provider_model and a.provider != b.provider:
-                pairs[f"{a.model} vs {b.model} (same model, different provider)"] = agreement(
-                    answers, a.model, b.model, question_ids)
+            if a.provider_model == b.provider_model:
+                kind = "same model, different provider" if a.provider != b.provider else "same model"
+            else:
+                kind = "same provider" if a.provider == b.provider else "different model and provider"
+            pairs[f"{a.model} vs {b.model} ({kind})"] = agreement(answers, a.model, b.model, question_ids)
     report = markdown(stats, pairs)
     print(report)
     if args.out:

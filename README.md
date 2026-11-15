@@ -15,7 +15,7 @@ print(reply.choices[0].message.content)
 print(reply.model_extra["gateway"])  # which model answered, why, and what it cost
 ```
 
-**Status:** phase 1. The gateway, routing, monitoring, release management and packaging are built and tested (220
+**Status:** phase 1. The gateway, routing, monitoring, release management and packaging are built and tested (221
 tests, all with fake providers or mocked HTTP). The router's training data is still being collected on the free
 tier (377 of 1,200 questions so far), so there are **no router results yet**. See [Results](#results).
 
@@ -333,7 +333,7 @@ GSM8K + MMLU questions, low reasoning effort. Full table: [`results/provider_com
 | OpenRouter gpt-oss-120b | 88.6% (85-91%) | $0.030 | 4.34 / 15.48 s |
 
 - The host made no measurable difference to accuracy (same model, Groq vs OpenRouter: exact McNemar p = 0.75 for 20b,
-  0.38 for 120b).
+  0.38 for 120b). The same model gave the same final answer on both hosts for 88% (20b) and 94% (120b) of questions.
 - 120b beat 20b on OpenRouter (p = 0.011); on Groq the gap was borderline (p = 0.059).
 - OpenRouter's 120b was both more accurate than Groq's 20b (p = 0.005) and 43% cheaper, but its latency was 6-14x
   higher, with a long tail.

@@ -16,8 +16,15 @@ Questions answered by every model: 377.
 | or-gpt-oss-20b | 91.7% (133) | 80.3% (244) |
 | or-gpt-oss-120b | 94.7% (133) | 85.2% (244) |
 
-gpt-oss-20b vs or-gpt-oss-20b (same model, different provider): both_right 297, both_wrong 41, only_gpt-oss-20b 18, only_or-gpt-oss-20b 21
+Question by question (first vs second model): right or wrong together, the same final answer, and the exact McNemar test of the accuracy difference.
 
-gpt-oss-120b vs or-gpt-oss-120b (same model, different provider): both_right 321, both_wrong 35, only_gpt-oss-120b 8, only_or-gpt-oss-120b 13
+| Pair | Both right | Both wrong | Only first right | Only second right | Same final answer | McNemar p |
+|---|---|---|---|---|---|---|
+| gpt-oss-20b vs gpt-oss-120b (same provider) | 298 | 31 | 17 | 31 | 324 (86%) | 0.059 |
+| gpt-oss-20b vs or-gpt-oss-20b (same model, different provider) | 297 | 41 | 18 | 21 | 331 (88%) | 0.749 |
+| gpt-oss-20b vs or-gpt-oss-120b (different model and provider) | 303 | 31 | 12 | 31 | 329 (87%) | 0.005 |
+| gpt-oss-120b vs or-gpt-oss-20b (different model and provider) | 307 | 37 | 22 | 11 | 335 (89%) | 0.080 |
+| gpt-oss-120b vs or-gpt-oss-120b (same model, different provider) | 321 | 35 | 8 | 13 | 353 (94%) | 0.383 |
+| or-gpt-oss-20b vs or-gpt-oss-120b (same provider) | 308 | 33 | 10 | 26 | 335 (89%) | 0.011 |
 
 Latency is the model's own time; answers saved before pacing waits were recorded separately are left out of it (n shows how many count). Calls, failures and rate limits cover every call the collection made for the model, after the registry's own retries.
