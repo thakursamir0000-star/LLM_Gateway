@@ -313,7 +313,9 @@ class Gateway:
         finally:
             call.latency_ms = round((time.perf_counter() - started) * 1000, 2)
         call.prompt_tokens, call.completion_tokens = completion.prompt_tokens, completion.completion_tokens
-        call.cost_usd = spec.cost(completion.prompt_tokens, completion.completion_tokens)
+        # The provider's own figure when it reports one (OpenRouter), else list prices from the config.
+        call.cost_usd = (completion.provider_cost_usd if completion.provider_cost_usd is not None
+                         else spec.cost(completion.prompt_tokens, completion.completion_tokens))
         call.provider_model = completion.model or spec.model
         return completion
 

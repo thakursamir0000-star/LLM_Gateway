@@ -6,23 +6,46 @@
 # ── Models ──────────────────────────────────────────────────────────
 # Each alias names one provider model. Prices are USD per 1M tokens and are
 # used for cost tracking, budgets and the router evaluation.
-# Groq prices are on-demand list prices; check https://groq.com/pricing before
-# quoting costs. The Gemini API models run on the free tier here, so no price
-# is set (cost shows as 0): set a list price to compare them on cost.
+# Groq prices are Groq's on-demand prices as listed for its endpoint on
+# OpenRouter (2026-11-15); check https://groq.com/pricing before quoting costs.
+# OpenRouter models: the price of the pinned host, checked with
+# GET https://openrouter.ai/api/v1/models/<model>/endpoints on 2026-11-15; the
+# gateway records the cost OpenRouter reports for each call instead when it
+# has one. The Gemini API models run on the free tier here, so no price is set
+# (cost shows as 0): set a list price to compare them on cost.
 # `limits` are client-side pacing under free-tier limits (0 = off).
 models:
   gpt-oss-20b:
     provider: groq
     model: openai/gpt-oss-20b
-    price_per_1m: {input: 0.10, output: 0.50}
+    price_per_1m: {input: 0.075, output: 0.30}
     limits: {rpm: 30, tpm: 8000}
     params: {reasoning_effort: low}
   gpt-oss-120b:
     provider: groq
     model: openai/gpt-oss-120b
-    price_per_1m: {input: 0.15, output: 0.75}
+    price_per_1m: {input: 0.15, output: 0.60}
     limits: {rpm: 30, tpm: 8000}
     params: {reasoning_effort: low}
+  # The same open-weight models through OpenRouter, pinned to one full-precision
+  # (bf16) host so a comparison isn't mixed across hosts and quantizations
+  # (OpenRouter serves these models from 12 and 26 hosts, fp4 to bf16).
+  or-gpt-oss-20b:
+    provider: openrouter
+    model: openai/gpt-oss-20b
+    price_per_1m: {input: 0.03, output: 0.14}
+    limits: {rpm: 30}
+    params:
+      reasoning_effort: low
+      provider: {only: [deepinfra/bf16], allow_fallbacks: false}
+  or-gpt-oss-120b:
+    provider: openrouter
+    model: openai/gpt-oss-120b
+    price_per_1m: {input: 0.037, output: 0.17}
+    limits: {rpm: 30}
+    params:
+      reasoning_effort: low
+      provider: {only: [deepinfra/bf16], allow_fallbacks: false}
   gemini-4-hydrogen:
     provider: gemini
     model: gemini-4-hydrogen
@@ -40,6 +63,10 @@ providers:
   gemini:
     base_url: https://generativelanguage.googleapis.com/v1beta
     api_key_env: GEMINI_API_KEY
+    timeout_s: 120
+  openrouter:
+    base_url: https://openrouter.ai/api/v1
+    api_key_env: OPENROUTER_API_KEY
     timeout_s: 120
 
 # ── Prompts ─────────────────────────────────────────────────────────
@@ -64,6 +91,11 @@ releases:
     strong: gpt-oss-120b
     prompt: concise@1
     note: candidate - Gemma on the Gemini API as the cheap model
+  v3-openrouter:
+    cheap: or-gpt-oss-20b
+    strong: or-gpt-oss-120b
+    prompt: passthrough@1
+    note: candidate - the same gpt-oss pair through OpenRouter (not active; compare first)
 
 # Starting state; the deployment log in the database takes over after the
 # first activate / rollback / canary change.

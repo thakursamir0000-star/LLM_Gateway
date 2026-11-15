@@ -29,6 +29,8 @@ class Completion:
     completion_tokens: int = 0  # includes reasoning ("thinking") tokens, which are billed as output
     model: str = ""  # provider model name
     latency_ms: float | None = None  # the successful provider call only (no pacing waits or retries)
+    provider_cost_usd: float | None = None  # cost the provider reported for this call (OpenRouter), if any
+    served_by: str | None = None  # the host that ran the model, for routers like OpenRouter
 
 
 class ProviderError(Exception):
@@ -92,8 +94,9 @@ _RETRY_AFTER = (
     re.compile(r"retry in ([\d.]+)s"),  # Gemini: "Please retry in 33.6s."
     re.compile(r"retryDelay'?\"?:\s*'?\"?([\d.]+)s"),  # Gemini RetryInfo: "retryDelay": "33s"
 )
-# Groq: "tokens per day (TPD)"; Gemini quota IDs: "GenerateRequestsPerDayPerProjectPerModel"
-_PER_DAY = re.compile(r"per ?day|\bTPD\b|\bRPD\b", flags=re.IGNORECASE)
+# Groq: "tokens per day (TPD)"; Gemini quota IDs: "GenerateRequestsPerDayPerProjectPerModel";
+# OpenRouter: "free-models-per-day"
+_PER_DAY = re.compile(r"per[ -]?day|\bTPD\b|\bRPD\b", flags=re.IGNORECASE)
 
 
 def retry_after_seconds(text: str) -> float | None:

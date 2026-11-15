@@ -37,8 +37,9 @@ def build_providers(config: GatewayConfig, *, fake: bool = False) -> dict[str, P
     from gateway.providers.fake import FakeProvider
     from gateway.providers.gemini import GeminiProvider
     from gateway.providers.groq import GroqProvider
+    from gateway.providers.openrouter import OpenRouterProvider
 
-    adapters: dict[str, type] = {"groq": GroqProvider, "gemini": GeminiProvider}
+    adapters: dict[str, type] = {"groq": GroqProvider, "gemini": GeminiProvider, "openrouter": OpenRouterProvider}
     providers: dict[str, Provider] = {}
     for name, spec in config.providers.items():
         if fake:
