@@ -4,8 +4,12 @@ Written by the router lab scripts (see the main README, "Train and evaluate the 
 
 - `questions.jsonl`: sampled GSM8K and MMLU questions with a fixed train/test split
   (`scripts/prepare_questions.py`).
-- `answers.jsonl`: both models' answers, graded, one line per call
+- `answers.jsonl`: both Groq models' answers, graded, one line per call
   (`scripts/collect_labels.py`, append-only and resumable).
+- `answers_openrouter.jsonl`: the same gpt-oss models through OpenRouter (pinned to the DeepInfra bf16 host), on
+  questions both Groq models answered, kept separate from the Groq file. Each record also has `provider`,
+  `served_by` (the host), `cost_usd` (list-price estimate) and `provider_cost_usd` (the cost OpenRouter reported).
+  So far: a 10-question pilot (2026-11-15).
 
 Commit both once collected: the answers cost days of free-tier quota, and the
 evaluation and training are reproducible from them without any API calls.

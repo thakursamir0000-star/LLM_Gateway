@@ -15,7 +15,7 @@ print(reply.choices[0].message.content)
 print(reply.model_extra["gateway"])  # which model answered, why, and what it cost
 ```
 
-**Status:** phase 1. The gateway, routing, monitoring, release management and packaging are built and tested (175
+**Status:** phase 1. The gateway, routing, monitoring, release management and packaging are built and tested (202
 tests, all with fake providers or mocked HTTP). The router's training data is still being collected on the free
 tier (377 of 1,200 questions so far), so there are **no router results yet**. See [Results](#results).
 
@@ -23,8 +23,10 @@ tier (377 of 1,200 questions so far), so there are **no router results yet**. Se
 
 - **OpenAI-compatible API**: `POST /v1/chat/completions` (with `stream: true`), `GET /v1/models`, plus
   `POST /v1/feedback` for thumbs up/down. Errors use OpenAI's error format.
-- **Providers**: Groq (`openai/gpt-oss-20b` as the cheap model, `openai/gpt-oss-120b` as the strong one) and the Gemini
-  API (Gemini and Gemma models). Calls are paced under each model's free-tier limits and retried within bounds.
+- **Providers**: Groq (`openai/gpt-oss-20b` as the cheap model, `openai/gpt-oss-120b` as the strong one), OpenRouter
+  (the same two models, pinned to one full-precision host, with the real per-call cost it reports) and the Gemini API
+  (Gemini and Gemma models). Calls are paced under each model's limits and retried within bounds; provider errors are
+  stripped of account ids and keys before they are logged or returned.
 - **Routing modes**, chosen per request with the `model` field:
   `cheap`, `strong`, `router` (trained classifier, or a rule-based baseline) and `cascade` (cheap first, escalate when
   the answer looks unsure). `auto` uses the configured default.
@@ -48,6 +50,7 @@ flowchart LR
     Svc --> Router["Router<br/>rules | classifier"]
     Svc --> Reg["Model registry<br/>pacing, retries"]
     Reg --> Groq["Groq<br/>gpt-oss-20b / 120b"]
+    Reg --> OpenRouter["OpenRouter<br/>gpt-oss-20b / 120b<br/>(pinned host)"]
     Reg --> Gemini["Gemini API<br/>Gemini / Gemma"]
     Svc --> Check["Cascade check<br/>escalate if unsure"]
     Svc --> DB[("SQLite<br/>requests, calls, feedback,<br/>deployments, alerts")]
@@ -105,8 +108,8 @@ python scripts/send_demo_traffic.py --n 300
 streamlit run dashboard/app.py
 ```
 
-**With real models**: copy `.env.example` to `.env`, set `GROQ_API_KEY` (and `GEMINI_API_KEY` for Gemini/Gemma),
-then `python -m gateway`. The gateway listens on `http://127.0.0.1:8000` (`GATEWAY_HOST`, `GATEWAY_PORT`).
+**With real models**: copy `.env.example` to `.env`, set `GROQ_API_KEY` (plus `OPENROUTER_API_KEY` for the
+`or-*` models and `GEMINI_API_KEY` for Gemini/Gemma), then `python -m gateway`. The gateway listens on `http://127.0.0.1:8000` (`GATEWAY_HOST`, `GATEWAY_PORT`).
 
 ```bash
 curl http://127.0.0.1:8000/v1/chat/completions -H "Content-Type: application/json" -H "X-App-Id: my-app" -d '{"model": "auto", "messages": [{"role": "user", "content": "Explain step by step why the sky is blue."}]}'
@@ -251,6 +254,23 @@ pip install -r requirements-lab.txt
    python scripts/evaluate_router.py
    ```
 
+5. **Compare providers** (no API calls). Another provider's models answer the same questions into their own file,
+   with the provider, the host that served each answer, tokens, latency, the list-price estimate and the reported
+   cost; a lock file stops two runs writing one file. For example, OpenRouter on 10 of the questions both Groq models
+   answered, reading the key from another project's `.env` (never printed):
+
+   ```bash
+   python scripts/collect_labels.py --cheap or-gpt-oss-20b --strong or-gpt-oss-120b --answers router_data/answers_openrouter.jsonl --only-answered-in router_data/answers.jsonl --sample 10 --env-file ../Agentai/.env --yes
+   ```
+
+   `compare_providers.py` then compares every model on the questions they all answered: accuracy with 95%
+   intervals, input/output tokens, cost per 1,000 questions, latency mean/p50/p95, failures and rate limits, and how
+   often one model gives a different result on two hosts.
+
+   ```bash
+   python scripts/compare_providers.py
+   ```
+
 ## Results
 
 **Pending.** No router has been trained and no evaluation has been run, so there are no accuracy, cost-saving or
@@ -258,7 +278,8 @@ latency numbers yet. They will come from `scripts/evaluate_router.py` on the hel
 collected, and will be reported here with the chart, including where the router does not beat the baselines.
 Collected so far: 377 of 1,200 questions (2026-11-15, stopped at Groq's daily token limit). A preliminary pass of
 training and evaluation on them ran end to end, but is too small to report: only 23 training questions needed the
-strong model.
+strong model. An OpenRouter pilot on 10 of those questions checked the second provider end to end; 10 questions are
+too few to compare accuracy.
 
 ## API
 
@@ -302,13 +323,13 @@ gateway/            the service
   app.py            FastAPI app and endpoints
   service.py        the request pipeline
   config.py         config schema and loading
-  providers/        Groq and Gemini adapters, fake provider, model registry (pacing, retries)
+  providers/        Groq, OpenRouter and Gemini adapters, fake provider, model registry (pacing, retries)
   routing/          rules, embeddings, logistic regression, classifier, cascade check
   monitoring/       SQLite store, metrics, alerts
   manage/           releases (activate, rollback, canary), budgets, CLI
 dashboard/app.py    Streamlit dashboard
-router_lab/         questions and grading, resumable collection, labels, evaluation
-scripts/            prepare_questions, collect_labels, train_router, evaluate_router, send_demo_traffic
+router_lab/         questions and grading, resumable collection, labels, evaluation, provider comparison
+scripts/            prepare_questions, collect_labels, train_router, evaluate_router, compare_providers, send_demo_traffic
 config/gateway.yaml configuration
 tests/              pytest suite
 ```
