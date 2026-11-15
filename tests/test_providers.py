@@ -297,3 +297,22 @@ def test_registry_records_the_model_time_of_the_successful_call(config):
     registry = ModelRegistry(config, {"groq": FakeProvider("groq", latency_s=0.02), "gemini": FakeProvider()})
     completion = run(registry.complete("small", USER, {}))
     assert completion.latency_ms is not None and completion.latency_ms >= 5
+
+
+def test_error_messages_hide_account_ids_and_keys():
+    from gateway.providers.base import error_message, redact
+
+    groq = {"error": {"message": "Rate limit reached for model `openai/gpt-oss-120b` in organization "
+                                 "`org_01abcDEF234` service tier `on_demand` on tokens per day (TPD)"}}
+    message = error_message(json.dumps(groq))
+    assert "org_01abcDEF234" not in message and "org_[redacted]" in message and "tokens per day" in message
+    assert redact("key gsk_abcdefghijklmnop and AIzaSyA1234567890abcdefghij") == "key [redacted key] and [redacted key]"
+    assert redact("quota for projects/123456789 exceeded") == "quota for projects/[redacted] exceeded"
+
+
+def test_gateway_errors_returned_to_clients_are_redacted():
+    body = {"error": {"message": "Limit reached in organization `org_secret99` on tokens per day (TPD)"}}
+    mock, _ = transport(lambda r: httpx.Response(429, json=body))
+    with pytest.raises(ProviderError) as info:
+        run(GroqProvider("k", transport=mock).complete("m", USER, {}))
+    assert "org_secret99" not in str(info.value) and info.value.kind == QUOTA_EXHAUSTED

@@ -129,15 +129,31 @@ def classify_http_error(status: int, body: str, retry_after_header: str | None =
     return OTHER, retry_after
 
 
+# Account identifiers and key-like strings that providers put in error messages.
+_REDACT = (
+    (re.compile(r"\borg_[A-Za-z0-9]+"), "org_[redacted]"),  # Groq organization id
+    (re.compile(r"\bprojects/\d+"), "projects/[redacted]"),  # Google Cloud project number
+    (re.compile(r"\b(?:gsk_|sk-)[A-Za-z0-9_-]{8,}"), "[redacted key]"),
+    (re.compile(r"\bAIza[0-9A-Za-z_-]{20,}"), "[redacted key]"),
+)
+
+
+def redact(text: str) -> str:
+    """``text`` without account ids or keys, so errors can be logged, stored and returned to clients."""
+    for pattern, replacement in _REDACT:
+        text = pattern.sub(replacement, text)
+    return text
+
+
 def error_message(body: str, limit: int = 500) -> str:
-    """A short message from an error body (the JSON ``error.message`` when present)."""
+    """A short, redacted message from an error body (the JSON ``error.message`` when present)."""
     import json
 
     try:
         data = json.loads(body)
     except ValueError:
-        return body[:limit]
+        return redact(body[:limit])
     error = data.get("error") if isinstance(data, dict) else None
     if isinstance(error, dict) and error.get("message"):
-        return str(error["message"])[:limit]
-    return body[:limit]
+        return redact(str(error["message"])[:limit])
+    return redact(body[:limit])
