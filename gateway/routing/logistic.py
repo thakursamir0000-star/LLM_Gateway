@@ -101,6 +101,21 @@ def stratified_folds(y: np.ndarray, k: int, seed: int = 0) -> list[np.ndarray]:
     return [np.array(sorted(f), dtype=int) for f in folds]
 
 
+def oof_predict(X: np.ndarray, y: np.ndarray, l2: float, k: int = 5, seed: int = 0) -> np.ndarray:
+    """Out-of-fold probabilities: each row is scored by a model fitted without it (for choosing thresholds
+    on training data without the optimism of in-sample predictions)."""
+    X = np.asarray(X)
+    y = np.asarray(y)
+    out = np.empty(len(y), dtype=np.float64)
+    for fold in stratified_folds(y, k, seed):
+        if len(fold) == 0:
+            continue
+        train = np.setdiff1d(np.arange(len(y)), fold)
+        w, b = fit_logistic(X[train], y[train], l2)
+        out[fold] = predict_proba(X[fold], w, b)
+    return out
+
+
 def cross_validate(X: np.ndarray, y: np.ndarray, l2_grid: list[float], k: int = 5,
                    seed: int = 0) -> list[dict[str, float | None]]:
     """Mean held-out log loss and AUC of each l2 over ``k`` stratified folds."""

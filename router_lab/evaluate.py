@@ -54,6 +54,8 @@ class Point:
     strong_share: float  # share of requests that called the strong model
     llm_latency_s: float  # mean model time per request (both calls for an escalated cascade)
     n: int
+    latency_p50_s: float | None = None
+    latency_p95_s: float | None = None
 
 
 def items_from_pairs(pairs: list[Pair], config: GatewayConfig, cheap: str, strong: str) -> list[Item]:
@@ -73,7 +75,17 @@ def _point(strategy: str, threshold: float | None, correct: np.ndarray, cost: np
     n = len(correct)
     total = float(cost.sum())
     return Point(strategy, threshold, float(correct.mean()), total, total / n * 1000, float(strong_used.mean()),
-                 float(latency.mean()), n)
+                 float(latency.mean()), n, float(np.percentile(latency, 50)), float(np.percentile(latency, 95)))
+
+
+def route_correct(items: list[Item], to_strong: Sequence[bool]) -> np.ndarray:
+    """Per-question correctness of a strategy that sends each question to one model."""
+    return np.where(np.asarray(to_strong, dtype=bool), [i.strong_correct for i in items],
+                    [i.cheap_correct for i in items])
+
+
+def cascade_correct(items: list[Item], escalate: Sequence[bool]) -> np.ndarray:
+    return route_correct(items, escalate)  # an escalated question scores the strong answer
 
 
 def route_point(items: list[Item], to_strong: Sequence[bool], strategy: str, threshold: float | None) -> Point:
@@ -129,6 +141,13 @@ def cheapest_within(points: list[Point], target_accuracy: float) -> Point | None
     return min(good, key=lambda p: p.cost_usd) if good else None
 
 
+def choose_threshold(points: list[Point], strong_accuracy: float, max_drop: float) -> float | None:
+    """The threshold of the cheapest point within ``max_drop`` of always-strong accuracy. Call it with points
+    computed on training data only; the held-out set is then scored once at that threshold."""
+    best = cheapest_within(points, strong_accuracy - max_drop)
+    return None if best is None else best.threshold
+
+
 def router_latency_ms(score: Callable[[str], Any], texts: list[str], warmup: int = 3) -> dict[str, float]:
     """p50/p95/mean time of one ``score`` call per request (the router's added latency)."""
     for text in texts[:warmup]:
@@ -151,12 +170,13 @@ def router_latency_ms(score: Callable[[str], Any], texts: list[str], warmup: int
 # ── report ──────────────────────────────────────────────────────────
 
 def markdown_table(points: list[Point]) -> str:
-    lines = ["| Strategy | Threshold | Accuracy | Cost per 1k requests | Sent to strong | Mean model time |",
+    lines = ["| Strategy | Threshold | Accuracy | Cost per 1k requests | Sent to strong | Model time mean / p50 / p95 |",
              "|---|---|---|---|---|---|"]
     for p in points:
-        threshold = "-" if p.threshold is None else f"{p.threshold:.2f}"
+        threshold = "-" if p.threshold is None else f"{p.threshold:.3f}"
+        pct = ("-" if p.latency_p50_s is None else f"{p.latency_p50_s:.2f} / {p.latency_p95_s:.2f}")
         lines.append(f"| {p.strategy} | {threshold} | {p.accuracy:.1%} | ${p.cost_per_1k:.4f} | "
-                     f"{p.strong_share:.0%} | {p.llm_latency_s:.2f} s |")
+                     f"{p.strong_share:.0%} | {p.llm_latency_s:.2f} / {pct} s |")
     return "\n".join(lines)
 
 

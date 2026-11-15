@@ -257,7 +257,7 @@ def lab(tmp_path):
                 else f"How many apples are in basket number {i}")
         q = Question(f"gsm8k-{i:04d}", "gsm8k", "test" if i % 4 == 0 else "train", text, "12")
         questions.append(q)
-        cheap_right = (not hard) and rng.random() > 0.05
+        cheap_right = not hard  # easy questions: the cheap model is always right
         for model, right, tokens in (("small", cheap_right, 300), ("large", rng.random() > 0.05, 400)):
             log.append({"question_id": q.id, "split": q.split, "source": q.source, "model": model,
                         "correct": bool(right), "text": "Answer: 12" if right else "Answer: 7",
@@ -351,3 +351,74 @@ def test_collect_separates_model_time_from_pacing_waits(tmp_path):
     run_collect([GSM], answer_twelve, log, models=("small",))
     record = log.answers()[("gsm8k-0001", "small")]
     assert record["latency_ms"] >= 0 and record["wait_ms"] >= 0
+
+
+# ── hold-out-safe threshold selection ───────────────────────────────
+
+def test_out_of_fold_scores_are_not_optimistic():
+    from gateway.routing.logistic import fit_logistic, oof_predict, predict_proba, roc_auc
+
+    rng = np.random.default_rng(0)
+    X, y = rng.normal(size=(80, 60)), (rng.random(80) < 0.5).astype(float)  # labels are pure noise
+    w, b = fit_logistic(X, y, l2=0.01)
+    assert roc_auc(y, predict_proba(X, w, b)) > 0.95  # in-sample: memorised
+    assert roc_auc(y, oof_predict(X, y, l2=0.01)) < 0.75  # out-of-fold: about chance
+
+
+def test_choose_threshold_picks_the_cheapest_within_the_drop():
+    from router_lab.evaluate import choose_threshold
+
+    data = items([(True, True), (False, True), (False, False), (True, True)])
+    points = sweep(data, [0.9, 0.2, 0.5, 0.8], "router", [0.0, 0.3, 0.6, 1.0])
+    assert choose_threshold(points, 0.75, 0.0) == 0.3
+    assert choose_threshold(points, 0.75, 0.3) == 0.0  # within 30 points even always-cheap qualifies
+    assert choose_threshold(points, 0.99, 0.0) is None
+
+
+def write_second_provider(lab, flip_test=False):
+    """A second answer file (another 'provider') for the same questions, as a baseline."""
+    other = AnswerLog(lab / "answers_other.jsonl")
+    for r in AnswerLog(lab / "answers.jsonl").records():
+        correct = (not r["correct"]) if (flip_test and r["split"] == "test") else r["correct"]
+        other.append({**r, "model": "other-" + r["model"], "provider": "other", "correct": correct,
+                      "latency_ms": 2000.0, "wait_ms": 0})
+    return other.path
+
+
+def test_evaluation_never_uses_the_held_out_answers_to_choose(lab, monkeypatch):
+    pytest.importorskip("matplotlib")
+    config = write_config(lab)
+    common = ["--questions", str(lab / "questions.jsonl"), "--config", str(config)]
+    router = lab / "router.json"
+    assert run_main(load_script("train_router"), monkeypatch,
+                    [*common, "--answers", str(lab / "answers.jsonl"), "--embedder", "hashing:256",
+                     "--out", str(router)]) == 0
+    meta = json.loads(router.read_text())
+    assert meta["threshold_selection"]["criterion"].startswith("cheapest threshold within")
+    assert 0.0 <= meta["threshold"] <= 1.0
+
+    def evaluate(answers, out):
+        assert run_main(load_script("evaluate_router"), monkeypatch,
+                        [*common, "--answers", str(answers), "--router", str(router), "--out", str(out),
+                         "--baseline-answers", str(write_second_provider(lab))]) == 0
+        return json.loads((out / "router_eval.json").read_text())
+
+    first = evaluate(lab / "answers.jsonl", lab / "r1")
+    assert first["thresholds"]["classifier"] == {"threshold": meta["threshold"],
+                                                 "how": "chosen by train_router.py (out-of-fold)"}
+    assert first["thresholds"]["rules"]["how"] == "chosen on the training answers"
+    assert set(first["vs_always_strong"]) == {"rules", "classifier", "cascade"}
+    assert 0.0 <= first["vs_always_strong"]["classifier"]["mcnemar_p"] <= 1.0
+    assert {b["model"] for b in first["baselines"]} == {"small", "large", "other-small", "other-large"}
+    assert first["baseline_questions"] == 30
+    report = (lab / "r1" / "router_eval.md").read_text()
+    assert "## Fixed-model baselines (held-out questions every model answered: 30)" in report
+    assert "not a result to claim" in report
+
+    # Flip every held-out answer: the thresholds must not move (they come from training data only).
+    flipped = AnswerLog(lab / "flipped.jsonl")
+    for r in AnswerLog(lab / "answers.jsonl").records():
+        flipped.append({**r, "correct": (not r["correct"]) if r["split"] == "test" else r["correct"]})
+    second = evaluate(flipped.path, lab / "r2")
+    assert second["thresholds"] == first["thresholds"]
+    assert second["operating"] != first["operating"]  # the held-out results did change
