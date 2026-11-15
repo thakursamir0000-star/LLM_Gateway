@@ -69,6 +69,14 @@ def sample_and_split(pools: dict[str, list[Question]], counts: dict[str, int], t
     return sampled
 
 
+def sample(questions: list[Question], n: int, seed: int = 0) -> list[Question]:
+    """A seeded random ``n`` of ``questions``, kept in their original order (all of them if n >= len)."""
+    if n >= len(questions):
+        return list(questions)
+    keep = {q.id for q in random.Random(seed).sample(questions, n)}
+    return [q for q in questions if q.id in keep]
+
+
 def save_questions(path: str | Path, questions: list[Question]) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)

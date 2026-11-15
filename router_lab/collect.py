@@ -16,7 +16,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from gateway.providers import ModelRegistry
-from gateway.providers.base import AUTH, QUOTA_EXHAUSTED, ProviderError
+from gateway.providers.base import AUTH, QUOTA_EXHAUSTED, ProviderError, redact
 from router_lab.progress import AnswerLog
 from router_lab.questions import Question, grade, messages_for
 
@@ -32,6 +32,13 @@ class CollectSummary:
 async def collect(questions: list[Question], models: list[str], registry: ModelRegistry, log: AnswerLog, *,
                   params: dict[str, Any] | None = None, max_consecutive_errors: int = 5,
                   report: Callable[[str], None] = print) -> CollectSummary:
+    with log.lock():  # one writer per answer file, so no duplicate records
+        return await _collect(questions, models, registry, log, params or {}, max_consecutive_errors, report)
+
+
+async def _collect(questions: list[Question], models: list[str], registry: ModelRegistry, log: AnswerLog,
+                   params: dict[str, Any], max_consecutive_errors: int,
+                   report: Callable[[str], None]) -> CollectSummary:
     summary = CollectSummary()
     done = log.answers()
     consecutive = 0
@@ -42,20 +49,22 @@ async def collect(questions: list[Question], models: list[str], registry: ModelR
                 summary.skipped += 1
                 continue
             started = time.perf_counter()
+            spec = registry.spec(alias)
             record: dict[str, Any] = {"question_id": q.id, "split": q.split, "source": q.source, "model": alias,
-                                      "provider_model": registry.spec(alias).model,
+                                      "provider": spec.provider, "provider_model": spec.model,
                                       "ts": datetime.now(UTC).isoformat(timespec="seconds")}
             try:
-                completion = await registry.complete(alias, messages_for(q), params or {})
+                completion = await registry.complete(alias, messages_for(q), params)
             except ProviderError as e:
-                record.update(error=str(e)[:500], error_kind=e.kind,
+                record.update(error=redact(str(e))[:500], error_kind=e.kind, status=e.status,
                               latency_ms=round((time.perf_counter() - started) * 1000, 1))
                 log.append(record)
                 summary.errors += 1
                 consecutive += 1
                 report(f"  {q.id} {alias}: {e}")
                 if e.kind == QUOTA_EXHAUSTED:
-                    summary.stopped = f"daily quota used up for {alias}"
+                    summary.stopped = (f"out of credits for {alias}" if e.status == 402
+                                       else f"daily quota used up for {alias}")
                     return summary
                 if e.kind == AUTH:
                     summary.stopped = f"API key problem for {alias}: {e}"
@@ -72,7 +81,11 @@ async def collect(questions: list[Question], models: list[str], registry: ModelR
             record.update(correct=correct, extracted=extracted, gold=q.answer, text=completion.text,
                           finish_reason=completion.finish_reason, prompt_tokens=completion.prompt_tokens,
                           completion_tokens=completion.completion_tokens, latency_ms=round(model_ms, 1),
-                          wait_ms=round(max(0.0, total_ms - model_ms), 1), error=None)
+                          wait_ms=round(max(0.0, total_ms - model_ms), 1),
+                          # list-price estimate from the config, and the provider's own figure when it reports one
+                          cost_usd=round(spec.cost(completion.prompt_tokens, completion.completion_tokens), 10),
+                          provider_cost_usd=completion.provider_cost_usd, served_by=completion.served_by,
+                          error=None)
             log.append(record)
             summary.answered += 1
             position = summary.answered + summary.skipped + summary.errors

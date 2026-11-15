@@ -14,12 +14,17 @@ errors in a row: rerun it after the quota resets.
 
 On Groq's free tier openai/gpt-oss-120b allows 8,000 tokens per minute and
 200,000 per day, so a full run takes several days of daily runs.
+
+Another provider's models go in their own answer file, on the same questions:
+
+    python scripts/collect_labels.py --cheap or-gpt-oss-20b --strong or-gpt-oss-120b         --answers router_data/answers_openrouter.jsonl --only-answered-in router_data/answers.jsonl         --sample 10 --env-file "D:/New folder/Agentai/.env" --yes
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import sys
 from collections import Counter
 from pathlib import Path
@@ -33,8 +38,8 @@ from gateway.config import load_config
 from gateway.providers import ModelRegistry, build_providers
 from router_lab import safe_console
 from router_lab.collect import collect
-from router_lab.progress import AnswerLog
-from router_lab.questions import format_prompt, load_questions
+from router_lab.progress import AnswerLog, AnswerLogLocked
+from router_lab.questions import format_prompt, load_questions, sample
 
 
 def main() -> int:
@@ -47,12 +52,22 @@ def main() -> int:
     parser.add_argument("--strong", help="strong model alias (default: the active release's)")
     parser.add_argument("--split", choices=("all", "train", "test"), default="all")
     parser.add_argument("--limit", type=int, help="only the first N questions")
+    parser.add_argument("--only-answered-in", metavar="ANSWERS",
+                        help="only questions that every model in this answer file answered (same-question comparisons)")
+    parser.add_argument("--sample", type=int, help="a seeded random N of the selected questions")
+    parser.add_argument("--seed", type=int, default=0, help="seed for --sample")
+    parser.add_argument("--env-file", help="also read API keys from this .env file (never printed)")
     parser.add_argument("--max-tokens", type=int, default=2048, help="output token cap per answer")
     parser.add_argument("--dry-run", action="store_true", help="show what would run; no API calls")
     parser.add_argument("--yes", action="store_true", help="don't ask before spending API quota")
     args = parser.parse_args()
 
     load_dotenv(ROOT / ".env")
+    if args.env_file:
+        if not Path(args.env_file).exists():
+            print(f"--env-file not found: {args.env_file}", file=sys.stderr)
+            return 1
+        load_dotenv(args.env_file)  # adds missing variables; never overrides ones already set
     config = load_config(args.config)
     release = config.releases[config.deployment.active]
     models = [args.cheap or release.cheap, args.strong or release.strong]
@@ -63,6 +78,11 @@ def main() -> int:
     questions = load_questions(args.questions)
     if args.split != "all":
         questions = [q for q in questions if q.split == args.split]
+    if args.only_answered_in:
+        keep = AnswerLog(args.only_answered_in).answered_by_all()
+        questions = [q for q in questions if q.id in keep]
+    if args.sample:
+        questions = sample(questions, args.sample, args.seed)
     questions = questions[: args.limit] if args.limit else questions
     log = AnswerLog(args.answers)
     done = log.answers()
@@ -71,8 +91,9 @@ def main() -> int:
     print(f"questions: {len(questions)} ({dict(Counter(q.source for q in questions))})")
     for alias in models:
         spec = config.models[alias]
+        key = "set" if os.environ.get(config.providers[spec.provider].api_key_env) else "NOT SET"
         print(f"model {alias}: {spec.provider} {spec.model}, limits rpm={spec.limits.rpm} tpm={spec.limits.tpm}, "
-              f"params {spec.params}")
+              f"params {spec.params}, API key {key}")
     print(f"answers file: {args.answers} ({len(done)} answers saved, {todo} calls to go)")
     if args.dry_run:
         if questions:
@@ -95,7 +116,11 @@ def main() -> int:
         finally:
             await registry.aclose()
 
-    summary = asyncio.run(run())
+    try:
+        summary = asyncio.run(run())
+    except AnswerLogLocked as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
     answers = log.answers()
     print(f"\nanswered {summary.answered}, already done {summary.skipped}, errors {summary.errors}")
     for alias in models:

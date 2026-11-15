@@ -28,3 +28,6 @@ var/
 .DS_Store
 Thumbs.db
 .claude/
+
+# Lock held by a running label collection
+router_data/*.lock
