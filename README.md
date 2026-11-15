@@ -15,9 +15,9 @@ print(reply.choices[0].message.content)
 print(reply.model_extra["gateway"])  # which model answered, why, and what it cost
 ```
 
-**Status:** phase 1. The gateway, routing, monitoring, release management and packaging are built and tested (173
-tests, all with fake providers or mocked HTTP). The router has **not been trained or evaluated yet**: that needs
-real API calls on the free tier and is the next step. See [Results](#results).
+**Status:** phase 1. The gateway, routing, monitoring, release management and packaging are built and tested (175
+tests, all with fake providers or mocked HTTP). The router's training data is still being collected on the free
+tier (377 of 1,200 questions so far), so there are **no router results yet**. See [Results](#results).
 
 ## What it does
 
@@ -256,8 +256,9 @@ pip install -r requirements-lab.txt
 **Pending.** No router has been trained and no evaluation has been run, so there are no accuracy, cost-saving or
 latency numbers yet. They will come from `scripts/evaluate_router.py` on the held-out questions once the labels are
 collected, and will be reported here with the chart, including where the router does not beat the baselines.
-Collected so far: a 20-question pilot (of 1,200) that checked the pipeline and the grader on real answers; it is far
-too small to compare the models.
+Collected so far: 377 of 1,200 questions (2026-11-15, stopped at Groq's daily token limit). A preliminary pass of
+training and evaluation on them ran end to end, but is too small to report: only 23 training questions needed the
+strong model.
 
 ## API
 
