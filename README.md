@@ -15,7 +15,7 @@ print(reply.choices[0].message.content)
 print(reply.model_extra["gateway"])  # which model answered, why, and what it cost
 ```
 
-**Status:** phase 1. The gateway, routing, monitoring, release management and packaging are built and tested (202
+**Status:** phase 1. The gateway, routing, monitoring, release management and packaging are built and tested (220
 tests, all with fake providers or mocked HTTP). The router's training data is still being collected on the free
 tier (377 of 1,200 questions so far), so there are **no router results yet**. See [Results](#results).
 
@@ -30,6 +30,8 @@ tier (377 of 1,200 questions so far), so there are **no router results yet**. Se
 - **Routing modes**, chosen per request with the `model` field:
   `cheap`, `strong`, `router` (trained classifier, or a rule-based baseline) and `cascade` (cheap first, escalate when
   the answer looks unsure). `auto` uses the configured default.
+- **Latency-aware provider routing**: `interactive` requests go to fast models (Groq), `batch` requests to cheaper,
+  slower ones (OpenRouter), with fallback across providers and a cooldown for a model that is out of quota.
 - **One cost/quality knob**: a threshold in `[0, 1]`. Higher sends more traffic to the strong model.
 - **Monitoring**: every request is logged to SQLite (model, route decision, tokens, cost, latency, error; never the
   prompt or the answer). A Streamlit dashboard shows requests, cost per day, p50/p95 latency, error rate and the share
@@ -67,15 +69,20 @@ What happens to one request (`gateway/service.py`):
    requests go to the cheap model.
 4. **Release**: the active release, or the canary for its share of traffic (sticky per `user` when it is set). The
    release's prompt version is put before the app's messages.
-5. **Route**: the router scores P(cheap model is good enough); `score >= threshold` goes cheap, otherwise strong.
-6. **Call** through the registry: default params, pacing under per-minute limits, bounded retries. If the model fails,
-   the other tier is tried (`fallback_on_error`).
-7. **Cascade**: the cheap answer gets a heuristic confidence (empty, truncated, blocked, looping or hedged answers
-   score low); below the threshold the request is escalated to the strong model.
-8. **Log** one row per request and one per provider call; check alerts (at most once a minute).
+5. **Latency class**: `interactive` or `batch`, from the `X-Gateway-Latency` header or the app's default; it picks
+   which provider's models serve the request (see [Routing](#routing)).
+6. **Route**: the tier is fixed by the mode (`strong` by default), or the router scores P(cheap model is good enough)
+   and `score >= threshold` goes cheap, otherwise strong.
+7. **Call** through the registry: default params, pacing under per-minute limits, bounded retries. If the model fails,
+   the same tier on the other provider is tried, then the other tier (`fallback_on_error`).
+8. **Cascade**: the cheap answer gets a heuristic confidence (empty, truncated, blocked, looping or hedged answers
+   score low); below the threshold the request is escalated to the strong model of the same class.
+9. **Log** one row per request (including its latency class) and one per provider call; check alerts (at most once a
+   minute).
 
 The response is a normal `chat.completion` with an extra `gateway` object (request id, release, canary, mode, router,
-score, threshold, tier, model, escalation, fallback, cost, router time, reason) and `x-gateway-*` headers. `usage`
+score, threshold, latency class, tier, model, escalation, fallback, cost, router time, reason) and `x-gateway-*`
+headers. `usage`
 counts every provider call the request made (a cascade escalation pays for two).
 
 ## Quick start
@@ -126,9 +133,31 @@ in the container; without it the gateway uses the rule-based router.
 
 ## Routing
 
+Two choices are made per request: the **tier** (cheap or strong model) and the **latency class** (which provider
+serves it). The shipped config routes by latency class: on the measured questions the strong model was the better buy
+(see [Provider comparison](#provider-comparison-measured-2026-11-15)), and the bigger trade-off was speed against cost
+across providers.
+
+**Latency classes** (`interactive` | `batch`): a request sets its class with the `X-Gateway-Latency` header; otherwise
+the app's default from `latency.apps` applies, otherwise `latency.default` (`interactive`). A release can name other
+models for batch traffic; the active release `v4-latency` does:
+
+| | Interactive (fast) | Batch (cheaper, slower) |
+|---|---|---|
+| strong | Groq `gpt-oss-120b` | OpenRouter `gpt-oss-120b` (DeepInfra bf16) |
+| cheap | Groq `gpt-oss-20b` | OpenRouter `gpt-oss-20b` (DeepInfra bf16) |
+
+Releases without a `batch` block (such as `v1`, Groq only) serve both classes with the same models. Pinned models
+ignore the class.
+
+**Fallback across providers**: when a model fails, the gateway tries the same tier on the other class's model (the
+other provider), then the other tier. A model that hits a quota error (Groq's daily limit, OpenRouter out of credits) is
+skipped for `retries.quota_cooldown_s` (300 s, or longer if the provider says so), so later requests go straight to the
+other provider instead of failing first. Interactive traffic that falls back to OpenRouter is slower, but answered.
+
 | `model` value | What happens |
 |---|---|
-| `auto` | the configured `routing.default_mode` (`router` in the shipped config) |
+| `auto` | the configured `routing.default_mode` (`strong` in the shipped config) |
 | `router` | the router's score against the threshold picks cheap or strong |
 | `cascade` | cheap model first; escalate to strong when the answer check is below the threshold |
 | `cheap` / `strong` | always that tier of the active (or canary) release |
@@ -187,6 +216,17 @@ Rollback re-activates the release that was active before the current one and sto
 stable and canary traffic (requests, error rate, p50 latency, cost, thumbs up/down). The admin endpoints
 (`/admin/status`, `/admin/activate`, `/admin/rollback`, `/admin/canary`, `/admin/deployments`, `/admin/alerts`) are off
 unless `GATEWAY_ADMIN_KEY` is set, and then need it in the `X-Admin-Key` header.
+
+The config's `deployment.active` is only the starting state: once a database has a deployment log, the log wins. To
+move an existing install to the latency-aware release (or back to Groq only):
+
+```bash
+python -m gateway.manage activate v4-latency
+```
+
+```bash
+python -m gateway.manage activate v1
+```
 
 ## Budgets, feedback and alerts
 
@@ -315,7 +355,7 @@ OpenRouter calls hit the host's rate limit and succeeded on a rerun.
 | `/admin/*` | status, activate, rollback, canary (needs `GATEWAY_ADMIN_KEY`) |
 
 Request headers: `X-App-Id` (app name, when no gateway keys are configured), `X-Gateway-Threshold` (per-request
-threshold). Response headers: `x-gateway-request-id`, `x-gateway-model`, `x-gateway-tier`, `x-gateway-release`,
+threshold), `X-Gateway-Latency` (`interactive` or `batch`). Response headers: `x-gateway-request-id`, `x-gateway-model`, `x-gateway-tier`, `x-gateway-release`,
 `x-gateway-cost-usd`.
 
 ## Configuration
