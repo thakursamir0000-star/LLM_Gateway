@@ -29,6 +29,10 @@ class ClassifierRouter:
         self.bias = float(bias)
         self.embedder = embedder
         self.meta = meta or {}
+        cheap, strong = self.meta.get("cheap"), self.meta.get("strong")
+        self.model_aliases = (cheap, strong) if isinstance(cheap, str) and isinstance(strong, str) else None
+        threshold = self.meta.get("threshold")
+        self.selected_threshold = float(threshold) if isinstance(threshold, int | float) else None
         self.description = f"classifier ({embedder.name}, {self.meta.get('n_train', '?')} training questions)"
 
     @classmethod
@@ -36,6 +40,11 @@ class ClassifierRouter:
         data = json.loads(Path(path).read_text(encoding="utf-8"))
         if data.get("format") != FORMAT:
             raise ValueError(f"{path}: not a router file (format {data.get('format')!r}, expected {FORMAT!r})")
+        if not isinstance(data.get("cheap"), str) or not isinstance(data.get("strong"), str):
+            raise ValueError(f"{path}: router file must name its cheap and strong model aliases")
+        threshold = data.get("threshold")
+        if not isinstance(threshold, int | float) or isinstance(threshold, bool) or not 0 <= threshold <= 1:
+            raise ValueError(f"{path}: router file must have a selected threshold in [0, 1]")
         embedder = embedder or load_embedder(data["embedder"])
         weights = np.asarray(data["weights"], dtype=np.float64)
         probe = embedder.embed(["dimension check"])

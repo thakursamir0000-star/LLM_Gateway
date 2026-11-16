@@ -114,10 +114,11 @@ deployment:
 # ── Routing ─────────────────────────────────────────────────────────
 # Modes: cheap | strong | router | cascade. A request picks one with its
 # `model` field ("auto" = default_mode).
-# threshold: the one cost/quality knob. Router: send to the cheap model when
-# P(cheap model is good enough) >= threshold. Cascade: escalate to the strong
-# model when the cheap answer's confidence < threshold. Higher = more quality,
-# more cost. Override per request with the X-Gateway-Threshold header.
+# classifier_threshold is the classifier's authoritative runtime default. It
+# must match the selected threshold recorded in the trained artifact or the
+# gateway refuses to load that classifier. threshold remains the default for
+# the rules router and cascade. Higher = more quality and more cost. Override
+# either default per request with the X-Gateway-Threshold header.
 # default_mode is strong: on the measured questions the strong model was the
 # better buy (on OpenRouter it costs 17% more than the cheap one), and the
 # provider is chosen by latency class instead (below). The rule router stays
@@ -126,8 +127,9 @@ routing:
   default_mode: strong
   router: classifier      # rules | classifier (falls back to rules until a model is trained)
   classifier_path: models/router.json
+  classifier_threshold: 0.955
   threshold: 0.5
-  fallback_on_error: true # if the chosen model fails: same tier on the other provider, then the other tier
+  fallback_on_error: true # chosen model, same tier on the other provider, then both other-tier models
 
 # ── Latency classes ─────────────────────────────────────────────────
 # interactive | batch. A request sets it with the X-Gateway-Latency header;

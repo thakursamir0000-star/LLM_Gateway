@@ -130,7 +130,7 @@ def trained_router(tmp_path):
     w, b = fit_logistic(X, y, l2=0.1)
     router = ClassifierRouter(w, b, embedder, {"n_train": 60})
     path = tmp_path / "router.json"
-    router.save(path, cheap="small", strong="large")
+    router.save(path, cheap="small", strong="large", threshold=0.5)
     return path
 
 
@@ -139,6 +139,7 @@ def test_classifier_router_round_trip(tmp_path):
     data = json.loads(path.read_text())
     assert data["format"] == FORMAT and data["embedder"] == "hashing:128" and data["cheap"] == "small"
     router = ClassifierRouter.load(path)
+    assert router.model_aliases == ("small", "large") and router.selected_threshold == 0.5
     easy = router.score(user("what is the capital of country number 99"))
     hard = router.score(user("prove the theorem and derive the integral bound number 99"))
     assert easy.score > 0.5 > hard.score
@@ -165,6 +166,10 @@ def test_build_router_falls_back_to_rules(tmp_path):
     good = trained_router(tmp_path)
     assert build_router(make_config(routing={"router": "classifier", "classifier_path": str(good)})).name == \
         "classifier"
+    mismatch = make_config(routing={"router": "classifier", "classifier_path": str(good),
+                                    "classifier_threshold": 0.955})
+    router = build_router(mismatch)
+    assert router.name == "rules" and "failed to load" in router.description
     assert build_router(make_config(routing={"router": "rules"})).name == "rules"
 
 

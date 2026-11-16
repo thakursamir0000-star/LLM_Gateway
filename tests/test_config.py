@@ -34,6 +34,7 @@ def test_cost_uses_prices_per_million(config):
     ({"deployment": {"active": "v1", "canary": {"release": "v1", "share": 0.1}}}, "must differ"),
     ({"deployment": {"active": "v1", "canary": {"release": "v2", "share": 1.5}}}, "less than or equal"),
     ({"routing": {"threshold": 2}}, "less than or equal"),
+    ({"routing": {"classifier_threshold": 2}}, "less than or equal"),
     ({"routing": {"default_mode": "fastest"}}, "default_mode"),
 ])
 def test_invalid_config_is_rejected(overrides, message):

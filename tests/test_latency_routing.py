@@ -16,7 +16,7 @@ from gateway.monitoring.store import RequestRecord, Store, iso, utc_now
 from gateway.providers import ModelRegistry
 from gateway.providers.base import OVERLOADED, QUOTA_EXHAUSTED, Completion, ProviderError
 from gateway.providers.fake import FakeProvider
-from gateway.routing import RulesRouter
+from gateway.routing import RouteScore, RulesRouter
 from gateway.service import Gateway
 from tests.conftest import make_config
 
@@ -58,12 +58,12 @@ async def no_sleep(_):
     return None
 
 
-def build(tmp_path, config=None, groq=None, openrouter=None):
+def build(tmp_path, config=None, groq=None, openrouter=None, router=None):
     config = config or latency_config()
     providers = {"groq": groq or FakeProvider("groq"), "gemini": FakeProvider("gemini"),
                  "openrouter": openrouter or FakeProvider("openrouter")}
     store = Store(tmp_path / "gw.db")
-    app = create_app(config, providers=providers, store=store, router=RulesRouter(), rng=random.Random(0),
+    app = create_app(config, providers=providers, store=store, router=router or RulesRouter(), rng=random.Random(0),
                      sleep=no_sleep)
     return SimpleNamespace(client=TestClient(app), store=store, app=app, **providers)
 
@@ -129,7 +129,33 @@ def test_latency_class_is_logged_and_summarised(tmp_path):
 
 
 def test_health_reports_the_default_class(tmp_path):
-    assert build(tmp_path).client.get("/health").json()["latency_default"] == "interactive"
+    health = build(tmp_path).client.get("/health").json()
+    assert health["latency_default"] == "interactive" and health["classifier_threshold"] == 0.5
+
+
+class OpenRouterClassifier:
+    name = "classifier"
+    description = "test OpenRouter classifier"
+    model_aliases = ("or-small", "or-large")
+
+    def score(self, messages):
+        return RouteScore(0.96, self.name, "P(cheap ok)=0.96")
+
+
+def test_openrouter_classifier_is_batch_only_and_auto_stays_strong(tmp_path):
+    config = latency_config(routing={"default_mode": "strong", "router": "classifier",
+                                     "classifier_threshold": 0.955})
+    gw = build(tmp_path, config=config, router=OpenRouterClassifier())
+
+    automatic = post(gw, {"X-Gateway-Latency": "batch"}).json()["gateway"]
+    assert automatic["model"] == "or-large" and automatic["mode"] == "strong"
+
+    batch = post(gw, {"X-Gateway-Latency": "batch"}, model="router").json()["gateway"]
+    assert batch["model"] == "or-small" and batch["tier"] == "cheap" and batch["threshold"] == 0.955
+
+    interactive = post(gw, model="router").json()["gateway"]
+    assert interactive["model"] == "large" and interactive["tier"] == "strong"
+    assert interactive["route_score"] is None and "classifier trained for" in interactive["reason"]
 
 
 # ── fallback across providers ───────────────────────────────────────
@@ -137,9 +163,9 @@ def test_health_reports_the_default_class(tmp_path):
 def test_fallback_order():
     release = latency_config().releases["lat"]
     assert Gateway.fallback_chain("strong", "large", release, "interactive") == [
-        ("strong", "large"), ("strong", "or-large"), ("cheap", "small")]
+        ("strong", "large"), ("strong", "or-large"), ("cheap", "small"), ("cheap", "or-small")]
     assert Gateway.fallback_chain("cheap", "or-small", release, "batch") == [
-        ("cheap", "or-small"), ("cheap", "small"), ("strong", "or-large")]
+        ("cheap", "or-small"), ("cheap", "small"), ("strong", "or-large"), ("strong", "large")]
     plain = make_config().releases["v1"]
     assert Gateway.fallback_chain("cheap", "small", plain, "batch") == [("cheap", "small"), ("strong", "large")]
 
@@ -180,7 +206,18 @@ def test_everything_down_returns_the_last_error(tmp_path):
     gw = build(tmp_path, groq=FakeProvider("groq", raising(everything)),
                openrouter=FakeProvider("openrouter", raising(everything)))
     response = post(gw)
-    assert response.status_code == 503 and len(calls(gw)) == 3
+    assert response.status_code == 503 and len(calls(gw)) == 4
+
+
+def test_fourth_fallback_candidate_is_used(tmp_path):
+    busy = ProviderError("busy", kind=OVERLOADED, status=503)
+    groq = FakeProvider("groq", raising({"openai/gpt-oss-120b": busy, "openai/gpt-oss-20b": busy}))
+    openrouter = FakeProvider("openrouter", raising({"openai/gpt-oss-120b": busy}))
+    gw = build(tmp_path, groq=groq, openrouter=openrouter)
+    body = post(gw).json()["gateway"]
+    assert body["model"] == "or-small" and body["tier"] == "cheap" and body["fallback"] is True
+    assert calls(gw) == [("strong", "large", "error"), ("strong", "or-large", "error"),
+                         ("cheap", "small", "error"), ("cheap", "or-small", "ok")]
 
 
 def test_cascade_escalates_to_the_strong_model_of_the_same_class(tmp_path):
@@ -256,3 +293,4 @@ def test_shipped_config_routes_by_latency_class():
     assert config.models[release.model_for("strong", "interactive")].provider == "groq"
     assert config.models[release.model_for("strong", "batch")].provider == "openrouter"
     assert config.latency.default == "interactive" and "v1" in config.releases  # v1 kept for rollback
+    assert config.routing.default_mode == "strong" and config.routing.classifier_threshold == 0.955

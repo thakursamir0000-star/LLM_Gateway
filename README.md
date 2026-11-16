@@ -32,7 +32,8 @@ router has been evaluated on the fixed 300-question held-out split. See [Results
   the answer looks unsure). `auto` uses the configured default.
 - **Latency-aware provider routing**: `interactive` requests go to fast models (Groq), `batch` requests to cheaper,
   slower ones (OpenRouter), with fallback across providers and a cooldown for a model that is out of quota.
-- **One cost/quality knob**: a threshold in `[0, 1]`. Higher sends more traffic to the strong model.
+- **Audited cost/quality controls**: separate classifier and rules/cascade defaults in `[0, 1]`. Higher sends more
+  traffic to the strong model, and the classifier default must match its trained artifact.
 - **Monitoring**: every request is logged to SQLite (model, route decision, tokens, cost, latency, error; never the
   prompt or the answer). A Streamlit dashboard shows requests, cost per day, p50/p95 latency, error rate and the share
   per model. Alerts fire when the error rate or daily cost passes a limit.
@@ -151,9 +152,10 @@ Releases without a `batch` block (such as `v1`, Groq only) serve both classes wi
 ignore the class.
 
 **Fallback across providers**: when a model fails, the gateway tries the same tier on the other class's model (the
-other provider), then the other tier. A model that hits a quota error (Groq's daily limit, OpenRouter out of credits) is
-skipped for `retries.quota_cooldown_s` (300 s, or longer if the provider says so), so later requests go straight to the
-other provider instead of failing first. Interactive traffic that falls back to OpenRouter is slower, but answered.
+other provider), then both models in the other tier. Duplicate aliases are removed for releases that use the same
+models for both classes. A model that hits a quota error (Groq's daily limit, OpenRouter out of credits) is skipped for
+`retries.quota_cooldown_s` (300 s, or longer if the provider says so), so later requests go straight to the next
+candidate. Interactive traffic that falls back to OpenRouter is slower, but answered.
 
 | `model` value | What happens |
 |---|---|
@@ -163,10 +165,12 @@ other provider instead of failing first. Interactive traffic that falls back to 
 | `cheap` / `strong` | always that tier of the active (or canary) release |
 | `gpt-oss-120b`, `openai/gpt-oss-120b`, ... | a configured model, pinned: no routing, no fallback |
 
-**The threshold** (`routing.threshold`, per request with the `X-Gateway-Threshold` header) is the single knob. Every
-router outputs P(cheap model is good enough); requests with a score below the threshold go to the strong model. In
-cascade mode, cheap answers whose confidence is below the threshold are escalated. `0` = always cheap, `1` = (almost)
-always strong.
+**Thresholds**: `routing.classifier_threshold` is the classifier's authoritative runtime default. It must match the
+training-selected threshold recorded in the artifact or the gateway refuses to load that classifier.
+`routing.threshold` is the default for the rules router and cascade. Every router outputs P(cheap model is good
+enough); requests with a score below its threshold go to the strong model. In cascade mode, cheap answers whose
+confidence is below `routing.threshold` are escalated. `X-Gateway-Threshold` is an explicit, logged per-request
+override. `0` = always cheap, `1` = (almost) always strong.
 
 **Rule-based router** (`gateway/routing/rules.py`): hand-weighted signals of a hard request (long context, code,
 maths, multi-step reasoning words, several questions, a long conversation). It is the baseline the trained router has
@@ -176,7 +180,13 @@ to beat.
 (`sentence-transformers/all-MiniLM-L6-v2` by default) followed by logistic regression that predicts whether the cheap
 model is good enough. The regression is fitted in numpy with Newton's method (a test checks it matches scikit-learn),
 so serving it needs no scikit-learn. It is loaded from `models/router.json`; until that file exists, the gateway falls
-back to the rules and says so in `/health`.
+back to the rules and says so in `/health`. The artifact names the cheap and strong aliases it was trained for. A
+classifier request is allowed only when those aliases match the selected release and latency class; a mismatch uses
+the strong model and records the reason.
+
+The prepared OpenRouter canary keeps `routing.default_mode: strong`. After the audited artifact is deliberately
+installed, only requests that explicitly use `model="router"` with `X-Gateway-Latency: batch` use it. Interactive
+router requests stay on the strong model because the artifact is trained for the OpenRouter batch aliases.
 
 **Cascade check** (`gateway/routing/cascade.py`): no extra model call, but it only catches answers that *look* wrong;
 a confident wrong answer passes. The evaluation measures how much that matters.
@@ -241,8 +251,8 @@ python -m gateway.manage activate v1
 
 ## Router lab: data, training, evaluation
 
-The router is trained on which questions the cheap model gets right. The scripts are ready but **have not been run
-against real APIs**: they use your keys and free quota.
+The router is trained on which questions the cheap model gets right. The OpenRouter collection and held-out
+evaluation are complete; the scripts use API keys and quota only when collecting new labels.
 
 ```bash
 pip install -r requirements-lab.txt
@@ -324,7 +334,7 @@ On the fixed 300-question held-out split, the trained classifier reached 88.0% a
 using the strong model. It sent 67% of questions to the strong model and reduced estimated cost by 8% ($0.0259
 versus $0.0282 per 1,000 requests). The one-answer difference was not significant (exact McNemar p = 1.000).
 Classifier scoring added 42 ms p50 and 117 ms p95 on this CPU. Its threshold is 0.955, selected from out-of-fold
-training scores. The gateway's runtime threshold remains the independently configured deployment knob.
+training scores and mirrored by `routing.classifier_threshold`. A mismatch prevents classifier loading.
 
 The rules baseline selected a threshold that sent every held-out question to the strong model. The cascade also
 escalated every question and cost 83% more than always-strong, so neither improved this OpenRouter pair.

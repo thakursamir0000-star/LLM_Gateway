@@ -102,6 +102,7 @@ class RoutingConfig(_Strict):
     default_mode: Mode = "router"
     router: Literal["rules", "classifier"] = "classifier"
     classifier_path: str = "models/router.json"
+    classifier_threshold: float = Field(0.5, ge=0, le=1)
     threshold: float = Field(0.5, ge=0, le=1)
     fallback_on_error: bool = True
 

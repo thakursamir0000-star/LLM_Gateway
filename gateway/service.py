@@ -12,7 +12,7 @@
 6. Route: the router's score against the threshold picks cheap or strong;
    cascade starts with cheap. The tier and the latency class pick the model.
 7. Call the model (paced, retried). If it fails, try the same tier on the other
-   latency class's model (another provider), then the other tier.
+   latency class's model, then both models in the other tier.
 8. Cascade: check the cheap answer and escalate to strong when unsure.
 9. Log one row per request and one per provider call, then check alerts.
 """
@@ -242,18 +242,30 @@ class Gateway:
         system_prompt = self.config.prompts[release.prompt]
         messages = ([{"role": "system", "content": system_prompt}] if system_prompt else []) + app_messages
 
-        threshold = self.config.routing.threshold if ctx.threshold is None else ctx.threshold
         latency = self.config.latency.class_for(ctx.app_id, ctx.latency)
+        classifier = mode == "router" and self.router.name == "classifier"
+        default_threshold = (self.config.routing.classifier_threshold if classifier
+                             else self.config.routing.threshold)
+        threshold = default_threshold if ctx.threshold is None else ctx.threshold
         record.mode, record.threshold, record.latency_class = ("pinned" if pinned else mode), threshold, latency
         if pinned:
             tier = "pinned"
         elif mode == "router":
-            t = time.perf_counter()
-            score = self.router.score(app_messages)
-            record.router_ms = round((time.perf_counter() - t) * 1000, 3)
-            record.router, record.route_score = score.router, score.score
-            notes.append(score.reason)
-            tier = choose_tier(score.score, threshold)
+            expected = (release.model_for("cheap", latency), release.model_for("strong", latency))
+            trained = getattr(self.router, "model_aliases", None)
+            if classifier and trained != expected:
+                record.router = self.router.name
+                notes.append(
+                    f"classifier trained for {trained}; release {release_name} {latency} uses {expected}: strong model"
+                )
+                tier = "strong"
+            else:
+                t = time.perf_counter()
+                score = self.router.score(app_messages)
+                record.router_ms = round((time.perf_counter() - t) * 1000, 3)
+                record.router, record.route_score = score.router, score.score
+                notes.append(score.reason)
+                tier = choose_tier(score.score, threshold)
         else:
             tier = "cheap" if mode == "cascade" else mode
         alias = pinned or release.model_for(tier, latency)
@@ -295,11 +307,12 @@ class Gateway:
     @staticmethod
     def fallback_chain(tier: str, alias: str, release: Release, latency: str) -> list[tuple[str, str]]:
         """(tier, model) to try in order: the chosen model, the same tier for the other latency
-        class (another provider, same quality), then the other tier."""
+        class (another provider, same quality), then the other tier on both latency classes."""
         other_class = "batch" if latency == "interactive" else "interactive"
         other_tier = "strong" if tier == "cheap" else "cheap"
         chain = [(tier, alias), (tier, release.model_for(tier, other_class)),
-                 (other_tier, release.model_for(other_tier, latency))]
+                 (other_tier, release.model_for(other_tier, latency)),
+                 (other_tier, release.model_for(other_tier, other_class))]
         unique: list[tuple[str, str]] = []
         for step in chain:
             if step[1] not in [a for _, a in unique]:

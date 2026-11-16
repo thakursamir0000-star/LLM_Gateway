@@ -183,7 +183,9 @@ def create_app(config: GatewayConfig | None = None, *, providers: dict[str, Prov
         state = releases.state()
         return {"status": "ok", "version": __version__, "release": state.active, "canary": state.canary,
                 "canary_share": state.canary_share, "default_mode": config.routing.default_mode,
-                "threshold": config.routing.threshold, "latency_default": config.latency.default,
+                "threshold": config.routing.threshold,
+                "classifier_threshold": config.routing.classifier_threshold,
+                "latency_default": config.latency.default,
                 "router": router.description, "fake_providers": fake,
                 "auth": "api_keys" if api_keys else "x-app-id"}
 
