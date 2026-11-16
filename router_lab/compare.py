@@ -160,6 +160,10 @@ def agreement(answers: dict[tuple[str, str], dict[str, Any]], a: str, b: str,
     return out
 
 
+def format_p(p: float) -> str:
+    return "<0.001" if p < 0.001 else f"{p:.3f}"
+
+
 def _ms(value: float | None) -> str:
     return "-" if value is None else f"{value:,.0f}"
 
@@ -198,7 +202,7 @@ def markdown(stats: list[ModelStats], pairs: dict[str, dict[str, Any]]) -> str:
         for name, c in pairs.items():
             lines.append(f"| {name} | {c['both_right']} | {c['both_wrong']} | {c['only_first']} | "
                          f"{c['only_second']} | {c['same_answer']} ({c['same_answer'] / c['n']:.0%}) | "
-                         f"{c['mcnemar_p']:.3f} |")
+                         f"{format_p(c['mcnemar_p'])} |")
     lines += ["", "Latency is the model's own time; answers saved before pacing waits were recorded separately "
                   "are left out of it (n shows how many count). Calls, failures and rate limits cover every call "
                   "the collection made for the model, after the registry's own retries."]

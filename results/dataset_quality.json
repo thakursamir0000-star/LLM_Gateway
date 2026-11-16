@@ -1,0 +1,150 @@
+{
+ "questions": 1200,
+ "splits": {
+  "train/gsm8k": 300,
+  "train/mmlu": 600,
+  "test/mmlu": 200,
+  "test/gsm8k": 100
+ },
+ "question_problems": [],
+ "models": [
+  {
+   "file": "D:\\New folder\\llm-gateway\\router_data\\answers.jsonl",
+   "model": "gpt-oss-120b",
+   "provider_models": {
+    "openai/gpt-oss-120b": 377
+   },
+   "records": 378,
+   "answered": 377,
+   "errors": {
+    "quota_exhausted": 1
+   },
+   "duplicates": 0,
+   "missing": 823,
+   "missing_examples": [
+    "gsm8k-0002",
+    "gsm8k-0006",
+    "gsm8k-0008",
+    "gsm8k-0018",
+    "gsm8k-0025"
+   ],
+   "unknown_ids": [],
+   "incomplete_records": 0,
+   "gold_mismatches": 0,
+   "split_or_source_mismatches": 0,
+   "no_extracted_answer": 0,
+   "truncated": 0,
+   "empty_text": 0,
+   "regrade_mismatches": 0,
+   "accuracy": 0.8726790450928382,
+   "served_by": {},
+   "reported_cost_usd": 0.040364699999999996,
+   "records_without_reported_cost": 377,
+   "examples": {}
+  },
+  {
+   "file": "D:\\New folder\\llm-gateway\\router_data\\answers.jsonl",
+   "model": "gpt-oss-20b",
+   "provider_models": {
+    "openai/gpt-oss-20b": 378
+   },
+   "records": 378,
+   "answered": 378,
+   "errors": {},
+   "duplicates": 0,
+   "missing": 822,
+   "missing_examples": [
+    "gsm8k-0002",
+    "gsm8k-0006",
+    "gsm8k-0008",
+    "gsm8k-0018",
+    "gsm8k-0025"
+   ],
+   "unknown_ids": [],
+   "incomplete_records": 0,
+   "gold_mismatches": 0,
+   "split_or_source_mismatches": 0,
+   "no_extracted_answer": 0,
+   "truncated": 0,
+   "empty_text": 0,
+   "regrade_mismatches": 0,
+   "accuracy": 0.8359788359788359,
+   "served_by": {},
+   "reported_cost_usd": 0.019629825,
+   "records_without_reported_cost": 378,
+   "examples": {}
+  },
+  {
+   "file": "D:\\New folder\\llm-gateway\\router_data\\answers_openrouter.jsonl",
+   "model": "or-gpt-oss-120b",
+   "provider_models": {
+    "openai/gpt-oss-120b": 1200
+   },
+   "records": 1200,
+   "answered": 1200,
+   "errors": {},
+   "duplicates": 0,
+   "missing": 0,
+   "missing_examples": [],
+   "unknown_ids": [],
+   "incomplete_records": 0,
+   "gold_mismatches": 0,
+   "split_or_source_mismatches": 0,
+   "no_extracted_answer": 0,
+   "truncated": 1,
+   "empty_text": 0,
+   "regrade_mismatches": 0,
+   "accuracy": 0.8883333333333333,
+   "served_by": {
+    "DeepInfra": 1200
+   },
+   "reported_cost_usd": 0.036009039,
+   "records_without_reported_cost": 0,
+   "examples": {
+    "truncated": [
+     "gsm8k-0205"
+    ]
+   }
+  },
+  {
+   "file": "D:\\New folder\\llm-gateway\\router_data\\answers_openrouter.jsonl",
+   "model": "or-gpt-oss-20b",
+   "provider_models": {
+    "openai/gpt-oss-20b": 1200
+   },
+   "records": 1202,
+   "answered": 1200,
+   "errors": {
+    "rate_limit": 2
+   },
+   "duplicates": 0,
+   "missing": 0,
+   "missing_examples": [],
+   "unknown_ids": [],
+   "incomplete_records": 0,
+   "gold_mismatches": 0,
+   "split_or_source_mismatches": 0,
+   "no_extracted_answer": 2,
+   "truncated": 0,
+   "empty_text": 0,
+   "regrade_mismatches": 0,
+   "accuracy": 0.8491666666666666,
+   "served_by": {
+    "DeepInfra": 1200
+   },
+   "reported_cost_usd": 0.03006633,
+   "records_without_reported_cost": 0,
+   "examples": {
+    "no extracted answer": [
+     "mmlu-12314: ...'iagnosis should not be disclosed to any of the listed parties.  \\n\\nAnswer: None\\n\\n'",
+     "mmlu-00457: ...'I\u2019m sorry, but I don\u2019t have enough information to determine the correct answer.'"
+    ]
+   }
+  }
+ ],
+ "answered_by_every_model": 377,
+ "answered_by_every_model_by_split": {
+  "train": 291,
+  "test": 86
+ }
+}

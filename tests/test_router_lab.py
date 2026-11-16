@@ -14,6 +14,7 @@ from gateway.providers.base import AUTH, OVERLOADED, QUOTA_EXHAUSTED, Completion
 from gateway.providers.fake import FakeProvider
 from gateway.routing import RulesRouter
 from router_lab.collect import collect
+from router_lab.compare import format_p
 from router_lab.dataset import build_pairs
 from router_lab.evaluate import (
     Item,
@@ -81,6 +82,16 @@ def test_grade():
     assert grade(GSM, "I don't know") == (False, None)
     assert grade(MMLU, "Answer: B") == (True, "B")
     assert grade(MMLU, "Answer: A") == (False, "A")
+
+
+@pytest.mark.parametrize(("value", "expected"), [
+    (0.0, "<0.001"),
+    (0.0009, "<0.001"),
+    (0.001, "0.001"),
+    (0.0114, "0.011"),
+])
+def test_format_p(value, expected):
+    assert format_p(value) == expected
 
 
 def test_dataset_rows_become_questions():

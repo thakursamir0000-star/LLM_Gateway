@@ -15,9 +15,9 @@ print(reply.choices[0].message.content)
 print(reply.model_extra["gateway"])  # which model answered, why, and what it cost
 ```
 
-**Status:** phase 1. The gateway, routing, monitoring, release management and packaging are built and tested (221
-tests, all with fake providers or mocked HTTP). The router's training data is still being collected on the free
-tier (377 of 1,200 questions so far), so there are **no router results yet**. See [Results](#results).
+**Status:** phase 1. The gateway, routing, monitoring, release management and packaging are built and tested, with
+fake providers or mocked HTTP. OpenRouter label collection is complete for all 1,200 questions, and the trained
+router has been evaluated on the fixed 300-question held-out split. See [Results](#results).
 
 ## What it does
 
@@ -313,17 +313,28 @@ pip install -r requirements-lab.txt
 
 ## Results
 
-**Pending.** No router has been trained and no evaluation has been run, so there are no accuracy, cost-saving or
-latency numbers yet. They will come from `scripts/evaluate_router.py` on the held-out questions once the labels are
-collected, and will be reported here with the chart, including where the router does not beat the baselines.
-Collected so far: 377 of 1,200 questions (2026-11-15, stopped at Groq's daily token limit). A preliminary pass of
-training and evaluation on them ran end to end, but is too small to report: only 23 training questions needed the
-strong model.
+OpenRouter answered all 1,200 questions with both models. The collection completed with no final-call errors and
+reported $0.06608 total cost, including the earlier 377-question comparison set. Dataset validation found no
+integrity problems. The complete reports are in
+[`results/dataset_quality.md`](results/dataset_quality.md),
+[`results/provider_comparison_openrouter_1200.md`](results/provider_comparison_openrouter_1200.md), and
+[`results/router_eval.md`](results/router_eval.md).
 
-### Provider comparison (measured 2026-11-15)
+On the fixed 300-question held-out split, the trained classifier reached 88.0% accuracy versus 88.3% for always
+using the strong model. It sent 67% of questions to the strong model and reduced estimated cost by 8% ($0.0259
+versus $0.0282 per 1,000 requests). The one-answer difference was not significant (exact McNemar p = 1.000).
+Classifier scoring added 42 ms p50 and 117 ms p95 on this CPU. Its threshold is 0.955, selected from out-of-fold
+training scores. The gateway's runtime threshold remains the independently configured deployment knob.
+
+The rules baseline selected a threshold that sent every held-out question to the strong model. The cascade also
+escalated every question and cost 83% more than always-strong, so neither improved this OpenRouter pair.
+
+### Provider comparison (measured 2026-11-15 to 2026-11-16)
 
 The same open-weight models on Groq and on OpenRouter (pinned to its DeepInfra bf16 host), on the 377 identical
-GSM8K + MMLU questions, low reasoning effort. Full table: [`results/provider_comparison.md`](results/provider_comparison.md).
+GSM8K + MMLU questions, low reasoning effort. The consolidated table is in
+[`results/provider_comparison.md`](results/provider_comparison.md). The full 1,200-question OpenRouter comparison is
+in [`results/provider_comparison_openrouter_1200.md`](results/provider_comparison_openrouter_1200.md).
 
 | Model | Accuracy (95% CI) | Cost per 1,000 questions | Latency p50 / p95 |
 |---|---|---|---|
@@ -339,6 +350,8 @@ GSM8K + MMLU questions, low reasoning effort. Full table: [`results/provider_com
   higher, with a long tail.
 - On OpenRouter 120b costs only 17% more than 20b, so cheap/strong routing there can save little; the larger trade-off
   is latency against cost, across providers.
+- Across all 1,200 OpenRouter questions, 120b scored 88.8% and 20b scored 84.9%. The difference was significant
+  (exact McNemar p < 0.001), and the models produced the same final answer on 88% of questions.
 
 Costs are list prices (OpenRouter's reported cost matched them on every call); Groq ran on its free tier. Latency was
 measured from one machine on one day; Groq latency excludes 20 early answers recorded with local pacing waits. Two

@@ -41,7 +41,7 @@ from gateway.routing import RulesRouter
 from gateway.routing.cascade import check_answer
 from gateway.routing.classifier import ClassifierRouter
 from router_lab import safe_console
-from router_lab.compare import common_questions, latest_answers, load_records, mcnemar_exact, model_stats
+from router_lab.compare import common_questions, format_p, latest_answers, load_records, mcnemar_exact, model_stats
 from router_lab.dataset import build_pairs
 from router_lab.evaluate import (
     cascade_confidences,
@@ -214,7 +214,7 @@ def main() -> int:
     ]
     for name, t in tests.items():
         lines.append(f"| {name} | {t['accuracy_diff'] * 100:+.1f} pts | {t['only_router_right']} | "
-                     f"{t['only_strong_right']} | {t['mcnemar_p']:.3f} | {t['cost_saving']:.0%} |")
+                     f"{t['only_strong_right']} | {format_p(t['mcnemar_p'])} | {t['cost_saving']:.0%} |")
     lines += ["", "A strategy improves on always-strong only if it costs less at an accuracy difference the test "
                   "can't tell from zero, or is more accurate with p < 0.05."]
     if baselines:

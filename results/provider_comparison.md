@@ -6,8 +6,8 @@ Questions answered by every model: 377.
 |---|---|---|---|---|---|---|---|---|---|---|
 | gpt-oss-20b (`openai/gpt-oss-20b`) | groq | 83.6% (79%-87%) | 177 | 128 | $0.0517 | - | 592 / 568 / 905 (357) | 378 | 0 | 0 |
 | gpt-oss-120b (`openai/gpt-oss-120b`) | groq | 87.3% (84%-90%) | 177 | 134 | $0.1071 | - | 716 / 689 / 1,118 (357) | 378 | 1 | 1 |
-| or-gpt-oss-20b (`openai/gpt-oss-20b`) | openrouter (DeepInfra 377) | 84.4% (80%-88%) | 160 | 146 | $0.0253 | $0.0253 | 1,635 / 1,411 / 3,367 (377) | 379 | 2 | 2 |
-| or-gpt-oss-120b (`openai/gpt-oss-120b`) | openrouter (DeepInfra 377) | 88.6% (85%-91%) | 160 | 140 | $0.0296 | $0.0296 | 6,137 / 4,342 / 15,476 (377) | 377 | 0 | 0 |
+| or-gpt-oss-20b (`openai/gpt-oss-20b`) | openrouter (DeepInfra 377) | 84.4% (80%-88%) | 160 | 146 | $0.0253 | $0.0253 | 1,635 / 1,411 / 3,367 (377) | 1202 | 2 | 2 |
+| or-gpt-oss-120b (`openai/gpt-oss-120b`) | openrouter (DeepInfra 377) | 88.6% (85%-91%) | 160 | 140 | $0.0296 | $0.0296 | 6,137 / 4,342 / 15,476 (377) | 1200 | 0 | 0 |
 
 | Model | gsm8k accuracy (n) | mmlu accuracy (n) |
 |---|---|---|
