@@ -1,0 +1,87 @@
+{
+ "models": [
+  {
+   "model": "or-gpt-oss-120b",
+   "provider": "openrouter",
+   "provider_model": "openai/gpt-oss-120b",
+   "n": 1200,
+   "correct": 1066,
+   "accuracy": 0.8883333333333333,
+   "ci_low": 0.869259160148116,
+   "ci_high": 0.9049290719249407,
+   "prompt_tokens_mean": 163.2225,
+   "completion_tokens_mean": 140.99,
+   "cost_per_1k_estimated": 0.0300075325,
+   "cost_per_1k_reported": 0.0300075325,
+   "latency_n": 1200,
+   "latency_mean_ms": 5595.304166666667,
+   "latency_p50_ms": 4244.4,
+   "latency_p95_ms": 13400.004999999996,
+   "calls": 1200,
+   "failures": 0,
+   "rate_limited": 0,
+   "failure_kinds": {},
+   "served_by": {
+    "DeepInfra": 1200
+   },
+   "by_source": {
+    "gsm8k": {
+     "n": 400,
+     "accuracy": 0.9625
+    },
+    "mmlu": {
+     "n": 800,
+     "accuracy": 0.85125
+    }
+   }
+  },
+  {
+   "model": "or-gpt-oss-20b",
+   "provider": "openrouter",
+   "provider_model": "openai/gpt-oss-20b",
+   "n": 1200,
+   "correct": 1019,
+   "accuracy": 0.8491666666666666,
+   "ci_low": 0.8278047617695509,
+   "ci_high": 0.8683001078412017,
+   "prompt_tokens_mean": 163.2225,
+   "completion_tokens_mean": 143.99,
+   "cost_per_1k_estimated": 0.025055275000000002,
+   "cost_per_1k_reported": 0.025055275,
+   "latency_n": 1200,
+   "latency_mean_ms": 2183.1274166666667,
+   "latency_p50_ms": 1556.9,
+   "latency_p95_ms": 5445.114999999999,
+   "calls": 1202,
+   "failures": 2,
+   "rate_limited": 2,
+   "failure_kinds": {
+    "rate_limit": 2
+   },
+   "served_by": {
+    "DeepInfra": 1200
+   },
+   "by_source": {
+    "gsm8k": {
+     "n": 400,
+     "accuracy": 0.9375
+    },
+    "mmlu": {
+     "n": 800,
+     "accuracy": 0.805
+    }
+   }
+  }
+ ],
+ "agreement": {
+  "or-gpt-oss-120b vs or-gpt-oss-20b (same provider)": {
+   "n": 1200,
+   "both_right": 987,
+   "both_wrong": 102,
+   "only_first": 79,
+   "only_second": 32,
+   "same_answer": 1062,
+   "mcnemar_p": 9.45104578240805e-06
+  }
+ }
+}

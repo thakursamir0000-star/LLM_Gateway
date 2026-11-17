@@ -1,0 +1,24 @@
+[project]
+name = "llm-gateway"
+version = "0.1.0"
+description = "OpenAI-compatible LLM gateway with a trained cost/quality router, request logging and monitoring"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q --tb=short"
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+extend-exclude = [".venv"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# Scripts and the Streamlit app add the project root to sys.path before importing it.
+"scripts/*.py" = ["E402"]
+"dashboard/*.py" = ["E402"]

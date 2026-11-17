@@ -1,0 +1,49 @@
+# Gateway on :8000, dashboard on :8501, sharing the SQLite request log in a volume.
+#   docker compose up --build
+#   WITH_EMBEDDINGS=true docker compose up --build    # include the classifier router's embedder
+# Keys come from .env (GROQ_API_KEY, OPENROUTER_API_KEY, GEMINI_API_KEY); set GATEWAY_FAKE_PROVIDERS=1 there to run without keys.
+
+x-image: &image
+  build:
+    context: .
+    args:
+      WITH_EMBEDDINGS: ${WITH_EMBEDDINGS:-false}
+  image: llm-gateway:local
+
+services:
+  gateway:
+    <<: *image
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      GATEWAY_DB: /app/var/gateway.db
+    ports:
+      - "8000:8000"
+    volumes:
+      - gateway-data:/app/var
+    restart: unless-stopped
+
+  dashboard:
+    <<: *image
+    command: ["streamlit", "run", "dashboard/app.py", "--server.address=0.0.0.0", "--server.port=8501",
+              "--server.headless=true"]
+    environment:
+      GATEWAY_DB: /app/var/gateway.db
+    ports:
+      - "8501:8501"
+    volumes:
+      - gateway-data:/app/var
+    depends_on:
+      gateway:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8501/_stcore/health', timeout=4)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+    restart: unless-stopped
+
+volumes:
+  gateway-data:

@@ -1,0 +1,200 @@
+{
+ "models": [
+  {
+   "model": "gpt-oss-20b",
+   "provider": "groq",
+   "provider_model": "openai/gpt-oss-20b",
+   "n": 377,
+   "correct": 315,
+   "accuracy": 0.8355437665782494,
+   "ci_low": 0.7947755011425115,
+   "ci_high": 0.8695426825853165,
+   "prompt_tokens_mean": 176.6206896551724,
+   "completion_tokens_mean": 128.0610079575597,
+   "cost_per_1k_estimated": 0.05166485411140583,
+   "cost_per_1k_reported": null,
+   "latency_n": 357,
+   "latency_mean_ms": 592.1974789915967,
+   "latency_p50_ms": 568.0,
+   "latency_p95_ms": 905.48,
+   "calls": 378,
+   "failures": 0,
+   "rate_limited": 0,
+   "failure_kinds": {},
+   "served_by": {},
+   "by_source": {
+    "gsm8k": {
+     "n": 133,
+     "accuracy": 0.8947368421052632
+    },
+    "mmlu": {
+     "n": 244,
+     "accuracy": 0.8032786885245902
+    }
+   }
+  },
+  {
+   "model": "gpt-oss-120b",
+   "provider": "groq",
+   "provider_model": "openai/gpt-oss-120b",
+   "n": 377,
+   "correct": 329,
+   "accuracy": 0.8726790450928382,
+   "ci_low": 0.8352312561201666,
+   "ci_high": 0.9026083076249706,
+   "prompt_tokens_mean": 176.6206896551724,
+   "completion_tokens_mean": 134.29177718832892,
+   "cost_per_1k_estimated": 0.10706816976127319,
+   "cost_per_1k_reported": null,
+   "latency_n": 357,
+   "latency_mean_ms": 715.7803921568627,
+   "latency_p50_ms": 689.1,
+   "latency_p95_ms": 1118.06,
+   "calls": 378,
+   "failures": 1,
+   "rate_limited": 1,
+   "failure_kinds": {
+    "quota_exhausted": 1
+   },
+   "served_by": {},
+   "by_source": {
+    "gsm8k": {
+     "n": 133,
+     "accuracy": 0.9323308270676691
+    },
+    "mmlu": {
+     "n": 244,
+     "accuracy": 0.8401639344262295
+    }
+   }
+  },
+  {
+   "model": "or-gpt-oss-20b",
+   "provider": "openrouter",
+   "provider_model": "openai/gpt-oss-20b",
+   "n": 377,
+   "correct": 318,
+   "accuracy": 0.843501326259947,
+   "ci_low": 0.8033815545237208,
+   "ci_high": 0.8766912106363878,
+   "prompt_tokens_mean": 159.6206896551724,
+   "completion_tokens_mean": 146.19098143236073,
+   "cost_per_1k_estimated": 0.025255358090185677,
+   "cost_per_1k_reported": 0.025255358090185677,
+   "latency_n": 377,
+   "latency_mean_ms": 1635.3344827586207,
+   "latency_p50_ms": 1411.1,
+   "latency_p95_ms": 3366.899999999999,
+   "calls": 1202,
+   "failures": 2,
+   "rate_limited": 2,
+   "failure_kinds": {
+    "rate_limit": 2
+   },
+   "served_by": {
+    "DeepInfra": 377
+   },
+   "by_source": {
+    "gsm8k": {
+     "n": 133,
+     "accuracy": 0.9172932330827067
+    },
+    "mmlu": {
+     "n": 244,
+     "accuracy": 0.8032786885245902
+    }
+   }
+  },
+  {
+   "model": "or-gpt-oss-120b",
+   "provider": "openrouter",
+   "provider_model": "openai/gpt-oss-120b",
+   "n": 377,
+   "correct": 334,
+   "accuracy": 0.8859416445623343,
+   "ci_low": 0.8498857172628805,
+   "ci_high": 0.9142114822027242,
+   "prompt_tokens_mean": 159.6206896551724,
+   "completion_tokens_mean": 139.52519893899205,
+   "cost_per_1k_estimated": 0.029625249336870028,
+   "cost_per_1k_reported": 0.029625249336870028,
+   "latency_n": 377,
+   "latency_mean_ms": 6137.397082228117,
+   "latency_p50_ms": 4342.3,
+   "latency_p95_ms": 15475.779999999999,
+   "calls": 1200,
+   "failures": 0,
+   "rate_limited": 0,
+   "failure_kinds": {},
+   "served_by": {
+    "DeepInfra": 377
+   },
+   "by_source": {
+    "gsm8k": {
+     "n": 133,
+     "accuracy": 0.9473684210526315
+    },
+    "mmlu": {
+     "n": 244,
+     "accuracy": 0.8524590163934426
+    }
+   }
+  }
+ ],
+ "agreement": {
+  "gpt-oss-20b vs gpt-oss-120b (same provider)": {
+   "n": 377,
+   "both_right": 298,
+   "both_wrong": 31,
+   "only_first": 17,
+   "only_second": 31,
+   "same_answer": 324,
+   "mcnemar_p": 0.05946337525377032
+  },
+  "gpt-oss-20b vs or-gpt-oss-20b (same model, different provider)": {
+   "n": 377,
+   "both_right": 297,
+   "both_wrong": 41,
+   "only_first": 18,
+   "only_second": 21,
+   "same_answer": 331,
+   "mcnemar_p": 0.7492586247608415
+  },
+  "gpt-oss-20b vs or-gpt-oss-120b (different model and provider)": {
+   "n": 377,
+   "both_right": 303,
+   "both_wrong": 31,
+   "only_first": 12,
+   "only_second": 31,
+   "same_answer": 329,
+   "mcnemar_p": 0.005401572654591291
+  },
+  "gpt-oss-120b vs or-gpt-oss-20b (different model and provider)": {
+   "n": 377,
+   "both_right": 307,
+   "both_wrong": 37,
+   "only_first": 22,
+   "only_second": 11,
+   "same_answer": 335,
+   "mcnemar_p": 0.08014331245794892
+  },
+  "gpt-oss-120b vs or-gpt-oss-120b (same model, different provider)": {
+   "n": 377,
+   "both_right": 321,
+   "both_wrong": 35,
+   "only_first": 8,
+   "only_second": 13,
+   "same_answer": 353,
+   "mcnemar_p": 0.38331031799316406
+  },
+  "or-gpt-oss-20b vs or-gpt-oss-120b (same provider)": {
+   "n": 377,
+   "both_right": 308,
+   "both_wrong": 33,
+   "only_first": 10,
+   "only_second": 26,
+   "same_answer": 335,
+   "mcnemar_p": 0.011330984183587134
+  }
+ }
+}

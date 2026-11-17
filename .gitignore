@@ -1,6 +1,8 @@
-# Secrets
+# Secrets (every .env variant except the committed template)
 .env
 .env.local
+.env.*
+!.env.example
 
 # Python
 __pycache__/
@@ -19,8 +21,15 @@ venv/
 .coverage
 htmlcov/
 
-# Runtime data (request log database)
+# Runtime data (request log database) and any other local database
 var/
+*.db
+*.sqlite
+*.sqlite3
+
+# Local model caches (Hugging Face downloads)
+.cache/
+hf-cache/
 
 # Editors / OS
 .vscode/
@@ -28,3 +37,6 @@ var/
 .DS_Store
 Thumbs.db
 .claude/
+
+# Lock held by a running label collection
+router_data/*.lock
