@@ -1,7 +1,7 @@
 # Gateway on :8000, dashboard on :8501, sharing the SQLite request log in a volume.
 #   docker compose up --build
 #   WITH_EMBEDDINGS=true docker compose up --build    # include the classifier router's embedder
-# Keys come from .env (GROQ_API_KEY, GEMINI_API_KEY); set GATEWAY_FAKE_PROVIDERS=1 there to run without keys.
+# Keys come from .env (GROQ_API_KEY, OPENROUTER_API_KEY, GEMINI_API_KEY); set GATEWAY_FAKE_PROVIDERS=1 there to run without keys.
 
 x-image: &image
   build:

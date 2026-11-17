@@ -422,7 +422,11 @@ tests/              pytest suite
 
 ## Limitations and next steps
 
-- Router results are pending (above). The rule weights are hand-set, and the cascade check is a heuristic.
+- The trained classifier is evaluated (see [Results](#results)) but not shipped: `models/router.json` is not
+  committed, so `model="router"` requests use the rule-based router. On the held-out questions it saved 8% against
+  always-strong with no significant accuracy difference; the two OpenRouter models' prices are close, so routing can
+  save little there, and it was trained on GSM8K and MMLU prompts only. The rule weights are hand-set, and the
+  cascade check is a heuristic.
 - `stream: true` returns the answer as SSE after the model finishes; there is no token-by-token streaming yet.
 - Text chat only: tools / function calling, images and `n > 1` are rejected with a clear 400.
 - SQLite fits one gateway instance; several instances would need a shared database (e.g. Postgres) and shared rate
