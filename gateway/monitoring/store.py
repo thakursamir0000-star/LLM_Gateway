@@ -98,6 +98,17 @@ CREATE TABLE IF NOT EXISTS alerts (
     threshold REAL,
     message TEXT NOT NULL
 );
+
+-- Budget held by requests in flight (one row per request, deleted when the request is logged).
+CREATE TABLE IF NOT EXISTS budget_reservations (
+    request_id TEXT PRIMARY KEY,
+    app_id TEXT NOT NULL,
+    day TEXT NOT NULL,
+    amount_usd REAL NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS budget_reservations_app_day ON budget_reservations (app_id, day);
 """
 
 # Columns added after the first release, created on older databases at startup.
@@ -166,6 +177,17 @@ class RequestRecord:
         return self.ts[:10]
 
 
+@dataclass(frozen=True)
+class BudgetReservation:
+    """The outcome of ``Store.reserve_budget``."""
+
+    admitted: bool
+    amount: float  # reserved for this request (0 when refused)
+    spent: float  # the app's logged spend for the day, before this request
+    reserved: float  # other requests' active reservations, before this request
+    limit: float
+
+
 class Store:
     def __init__(self, path: str | Path):
         self.path = str(path)
@@ -213,6 +235,9 @@ class Store:
 
     # ── requests ────────────────────────────────────────────────────
     def log_request(self, record: RequestRecord) -> None:
+        """Log a finished request and its calls, and settle its budget reservation, in one transaction:
+        its real cost counts toward the app's spend at the moment its reservation stops counting. A
+        request id can be logged once (primary key), so a reservation can't be settled twice."""
         values = asdict(record)
         calls = values.pop("calls")
         values["day"] = record.day
@@ -221,14 +246,60 @@ class Store:
         columns = ", ".join(values)
         marks = ", ".join("?" for _ in values)
         with self._lock:
-            self._conn.execute(f"INSERT INTO requests ({columns}) VALUES ({marks})", tuple(values.values()))
-            for call in calls:
-                call_values = {"request_id": record.id, "ts": record.ts, **call}
-                call_columns = ", ".join(call_values)
-                call_marks = ", ".join("?" for _ in call_values)
-                self._conn.execute(f"INSERT INTO calls ({call_columns}) VALUES ({call_marks})",
-                                   tuple(call_values.values()))
-            self._conn.commit()
+            try:
+                self._conn.execute(f"INSERT INTO requests ({columns}) VALUES ({marks})", tuple(values.values()))
+                for call in calls:
+                    call_values = {"request_id": record.id, "ts": record.ts, **call}
+                    call_columns = ", ".join(call_values)
+                    call_marks = ", ".join("?" for _ in call_values)
+                    self._conn.execute(f"INSERT INTO calls ({call_columns}) VALUES ({call_marks})",
+                                       tuple(call_values.values()))
+                self._conn.execute("DELETE FROM budget_reservations WHERE request_id = ?", (record.id,))
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()  # nothing half-written; the reservation stays until it expires
+                raise
+
+    # ── budget reservations ─────────────────────────────────────────
+    def reserve_budget(self, request_id: str, app_id: str, day: str, limit: float, estimate: float, now: str,
+                       expires_at: str) -> BudgetReservation:
+        """Atomically admit a request against ``limit`` and reserve up to ``estimate`` for it.
+
+        In one ``BEGIN IMMEDIATE`` transaction (SQLite's write lock, so other connections to the same
+        file wait too): expired reservations are deleted, then the request is admitted if the app's
+        logged spend for ``day`` plus its active reservations is below ``limit``, and reserves
+        ``min(estimate, what is left)``. ``now`` and ``expires_at`` are ISO timestamps (see ``iso``).
+        """
+        with self._lock:
+            if self._conn.in_transaction:
+                self._conn.commit()
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._conn.execute("DELETE FROM budget_reservations WHERE expires_at <= ?", (now,))
+                spent = float(self._conn.execute(
+                    "SELECT COALESCE(SUM(cost_usd), 0) FROM requests WHERE day = ? AND app_id = ?",
+                    (day, app_id)).fetchone()[0] or 0.0)
+                reserved = float(self._conn.execute(
+                    "SELECT COALESCE(SUM(amount_usd), 0) FROM budget_reservations WHERE day = ? AND app_id = ?",
+                    (day, app_id)).fetchone()[0] or 0.0)
+                left = limit - spent - reserved
+                admitted = left > 0
+                amount = min(max(estimate, 0.0), left) if admitted else 0.0
+                if admitted:
+                    self._conn.execute(
+                        "INSERT INTO budget_reservations (request_id, app_id, day, amount_usd, created_at, expires_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?)", (request_id, app_id, day, amount, now, expires_at))
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
+        return BudgetReservation(admitted, amount, spent, reserved, limit)
+
+    def reservations(self, app_id: str | None = None) -> list[dict[str, Any]]:
+        """Reservations in the table (active, or expired and not cleaned up yet), oldest first."""
+        if app_id is None:
+            return self.query("SELECT * FROM budget_reservations ORDER BY created_at")
+        return self.query("SELECT * FROM budget_reservations WHERE app_id = ? ORDER BY created_at", (app_id,))
 
     def request_app(self, request_id: str) -> str | None:
         """The app that made ``request_id`` (None if there is no such request)."""

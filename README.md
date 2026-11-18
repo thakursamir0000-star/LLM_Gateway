@@ -319,8 +319,13 @@ Phase 1 security hardening enforces production-safe defaults:
 
 - **Budgets**: `budgets.default_daily_usd` and per-app `budgets.apps.<app>.daily_usd` (USD per UTC day, from the list
   prices in the config). An app is identified by its bearer key when `GATEWAY_API_KEYS="app:key,..."` is set, or
-  by the `X-App-Id` header when anonymous access is explicitly enabled. A request's cost is known only after it runs,
-  so an app can overshoot by the requests in flight.
+  by the `X-App-Id` header when anonymous access is explicitly enabled. Before its provider call a request reserves
+  its estimated maximum cost (prompt plus `max_tokens`, or `budgets.reserve_output_tokens` output tokens, at the
+  dearest model it may call), capped at what is left, in one SQLite transaction that counts the day's spend and the
+  reservations of requests in flight; so concurrent requests can't share the same remaining budget. Logging the
+  request records its real cost and drops its reservation in the same transaction; a reservation a crashed process
+  never settled expires after `budgets.reservation_ttl_s`. A request is admitted while any budget is left, so the
+  last one admitted can still overshoot by the part of its real cost its reservation didn't cover.
 - **Feedback**: `POST /v1/feedback {"request_id": "<response id>", "score": "up" | "down" | 1 | -1, "comment": "..."}`.
 - **Alerts**: error rate over the last `window_minutes` (with at least `min_requests`) above `alerts.error_rate`, or
   today's cost above `alerts.daily_cost_usd`. Each alert is logged, stored (the dashboard shows it), and POSTed as JSON

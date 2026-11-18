@@ -156,9 +156,14 @@ circuit_breaker:
 # ── Budgets ─────────────────────────────────────────────────────────
 # Daily USD limit per app (UTC day). Over the soft limit, router/cascade/strong
 # requests go to the cheap model; at the limit, requests get HTTP 429.
+# Each request reserves its estimated maximum cost (capped at what is left)
+# before calling a provider, so concurrent requests can't share the same
+# remaining budget; the reservation is settled when the request is logged.
 budgets:
   default_daily_usd: 1.0
   soft_limit_fraction: 0.8
+  reserve_output_tokens: 4096   # output tokens assumed when a request sets no max_tokens
+  reservation_ttl_s: 900        # a reservation a crashed request never settled expires after this
   apps:
     demo: {daily_usd: 0.20}
 

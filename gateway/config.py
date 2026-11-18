@@ -138,6 +138,10 @@ class BudgetConfig(_Strict):
     default_daily_usd: float | None = Field(None, ge=0)
     soft_limit_fraction: float = Field(0.8, ge=0, le=1)
     apps: dict[str, AppBudget] = {}
+    # A request reserves its estimated maximum cost before the provider call; without max_tokens the
+    # output is assumed to be this many tokens. Reservations a crashed request never settled expire.
+    reserve_output_tokens: int = Field(4096, ge=1)
+    reservation_ttl_s: float = Field(900.0, gt=0)
 
 
 class AlertConfig(_Strict):

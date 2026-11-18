@@ -27,13 +27,13 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 import httpx
 
 from gateway.config import GatewayConfig, Release
-from gateway.manage.budgets import BudgetPolicy, seconds_until_utc_midnight
+from gateway.manage.budgets import BudgetPolicy, reservation_estimate, seconds_until_utc_midnight
 from gateway.manage.releases import ReleaseManager
 from gateway.monitoring.alerts import AlertMonitor
 from gateway.monitoring.store import CallRecord, RequestRecord, Store, iso, utc_now
@@ -222,13 +222,17 @@ class Gateway:
             error = from_provider_error(e)
             self._fail(record, error, detail=upstream_detail(record.id, e))
             raise error from e
+        except asyncio.CancelledError:
+            record.status, record.error_type = "error", "cancelled"
+            record.error_message = "client disconnected or request cancelled"
+            raise
         except Exception as e:
             log.exception("request %s failed", ctx.request_id)
             error = GatewayError(500, "internal gateway error", type_="server_error", code="internal_error")
             self._fail(record, error, detail=f"{type(e).__name__}: {e}")
             raise error from e
         finally:
-            self._finish(record, started)
+            self._finish(record, started)  # also settles the request's budget reservation
 
     async def stream(
         self, request: ChatRequest, ctx: RequestContext, expose_metadata: bool = True
@@ -284,12 +288,7 @@ class Gateway:
 
         budget = self.budgets.status(ctx.app_id, self.store.app_spend(ctx.app_id, record.day))
         if budget.exceeded:
-            err = GatewayError(
-                429, f"daily budget for app {ctx.app_id!r} is used up: ${budget.spent:.4f} of "
-                     f"${budget.limit:.2f} (resets at 00:00 UTC)",
-                type_="budget_exceeded", code="budget_exceeded", retry_after=seconds_until_utc_midnight(now),
-                counts_as_error=False)
-            raise err
+            raise self._budget_error(ctx.app_id, budget.spent, budget.limit, now)
         if budget.soft and mode in ("router", "cascade", "strong"):
             notes.append(f"over {self.budgets.config.soft_limit_fraction:.0%} of the daily budget: cheap model")
             mode = "cheap"
@@ -331,6 +330,7 @@ class Gateway:
 
         allow_fallback = not pinned and (self.config.routing.fallback_on_error or mode == "cascade")
         chain = self.fallback_chain(tier, alias, release, latency) if allow_fallback else [(tier, alias)]
+        self._reserve_budget(record, ctx.app_id, now, [a for _, a in chain], messages, params)
 
         active_gen = None
         active_tier = None
@@ -568,11 +568,7 @@ class Gateway:
 
         budget = self.budgets.status(ctx.app_id, self.store.app_spend(ctx.app_id, record.day))
         if budget.exceeded:
-            raise GatewayError(
-                429, f"daily budget for app {ctx.app_id!r} is used up: ${budget.spent:.4f} of "
-                     f"${budget.limit:.2f} (resets at 00:00 UTC)",
-                type_="budget_exceeded", code="budget_exceeded", retry_after=seconds_until_utc_midnight(now),
-                counts_as_error=False)
+            raise self._budget_error(ctx.app_id, budget.spent, budget.limit, now)
         if budget.soft and mode in ("router", "cascade", "strong"):
             notes.append(f"over {self.budgets.config.soft_limit_fraction:.0%} of the daily budget: cheap model")
             mode = "cheap"
@@ -613,6 +609,9 @@ class Gateway:
         params = request.params()
 
         allow_fallback = not pinned and (self.config.routing.fallback_on_error or mode == "cascade")
+        chain = self.fallback_chain(tier, alias, release, latency) if allow_fallback else [(tier, alias)]
+        escalation = release.model_for("strong", latency) if mode == "cascade" and not pinned else None
+        self._reserve_budget(record, ctx.app_id, now, [a for _, a in chain], messages, params, then=escalation)
         completion, tier, alias = await self._call_with_fallback(record, tier, alias, release, latency, messages,
                                                                  params, allow_fallback)
         if record.fallback:
@@ -700,6 +699,36 @@ class Gateway:
         record.prompt_tokens = sum(c.prompt_tokens for c in record.calls)
         record.completion_tokens = sum(c.completion_tokens for c in record.calls)
         record.cost_usd = sum(c.cost_usd for c in record.calls)
+
+    def _budget_error(self, app_id: str, spent: float, limit: float | None, now: datetime,
+                      reserved: float = 0.0) -> GatewayError:
+        held = f" (+${reserved:.4f} reserved by requests in progress)" if reserved > 0 else ""
+        return GatewayError(
+            429, f"daily budget for app {app_id!r} is used up: ${spent:.4f}{held} of ${limit or 0:.2f} "
+                 f"(resets at 00:00 UTC)",
+            type_="budget_exceeded", code="budget_exceeded", retry_after=seconds_until_utc_midnight(now),
+            counts_as_error=False)
+
+    def _reserve_budget(self, record: RequestRecord, app_id: str, now: datetime, aliases: list[str],
+                        messages: list[dict[str, Any]], params: dict[str, Any], then: str | None = None) -> None:
+        """Reserve the request's estimated maximum cost before any provider call (see manage/budgets.py).
+
+        ``aliases`` are the models the request may try in turn (one of them answers); ``then`` is a model
+        it may call after that (cascade escalation). Raises the budget-exceeded error when nothing is left.
+        The reservation is settled when the request is logged (``_finish``), whatever its outcome.
+        """
+        limit = self.budgets.limit(app_id)
+        if limit is None:
+            return
+        output_tokens = self.budgets.config.reserve_output_tokens
+        estimate = reservation_estimate((self.config.models[a] for a in aliases), messages, params, output_tokens)
+        if then is not None:
+            estimate += reservation_estimate([self.config.models[then]], messages, params, output_tokens)
+        expires = now + timedelta(seconds=self.budgets.config.reservation_ttl_s)
+        held = self.store.reserve_budget(record.id, app_id, record.day, limit, estimate, iso(self.clock()),
+                                         iso(expires))
+        if not held.admitted:
+            raise self._budget_error(app_id, held.spent, limit, now, reserved=held.reserved)
 
     def _finish(self, record: RequestRecord, started: float) -> None:
         """Log a finished request (once) and check alerts. Neither may break the response: a storage or
