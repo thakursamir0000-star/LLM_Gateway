@@ -48,6 +48,7 @@ from gateway.providers.base import (
     Completion,
     ProviderError,
     message_text,
+    redact,
 )
 from gateway.routing import Router, choose_tier, routing_text
 from gateway.routing.cascade import check_answer, should_escalate
@@ -79,20 +80,33 @@ class GatewayError(Exception):
         return {"error": {"message": self.message, "type": self.type, "param": self.param, "code": self.code}}
 
 
+# What a client sees when the upstream call fails: status, type, code and a generic message per kind.
+# The provider's own message can name the provider, model, account, service tier or quota figures, so
+# it stays server-side (the request log and the gateway's log; see upstream_detail).
 _PROVIDER_ERRORS = {
-    RATE_LIMIT: (429, "rate_limit_error", "rate_limit_exceeded"),
-    QUOTA_EXHAUSTED: (429, "rate_limit_error", "upstream_quota_exhausted"),
-    AUTH: (502, "upstream_error", "upstream_auth_failed"),
-    BAD_REQUEST: (400, "invalid_request_error", "upstream_bad_request"),
-    TIMEOUT: (504, "upstream_error", "upstream_timeout"),
-    OVERLOADED: (503, "upstream_error", "upstream_unavailable"),
+    RATE_LIMIT: (429, "rate_limit_error", "rate_limit_exceeded", "the upstream model is rate limited; retry later"),
+    QUOTA_EXHAUSTED: (429, "rate_limit_error", "upstream_quota_exhausted",
+                      "the upstream model's quota is used up; retry later"),
+    AUTH: (502, "upstream_error", "upstream_auth_failed", "the gateway could not authenticate with the upstream provider"),
+    BAD_REQUEST: (400, "invalid_request_error", "upstream_bad_request", "the upstream provider rejected the request"),
+    TIMEOUT: (504, "upstream_error", "upstream_timeout", "the upstream model timed out"),
+    OVERLOADED: (503, "upstream_error", "upstream_unavailable", "the upstream model is unavailable"),
 }
+_OTHER_PROVIDER_ERROR = (502, "upstream_error", "upstream_error", "the upstream model call failed")
 
 
 def from_provider_error(error: ProviderError) -> GatewayError:
-    status, type_, code = _PROVIDER_ERRORS.get(error.kind, (502, "upstream_error", "upstream_error"))
-    return GatewayError(status, f"upstream model call failed: {error}", type_=type_, code=code,
-                        retry_after=error.retry_after, counts_as_error=error.kind != BAD_REQUEST)
+    """The client-facing error for a failed upstream call: generic message, useful status and code."""
+    status, type_, code, message = _PROVIDER_ERRORS.get(error.kind, _OTHER_PROVIDER_ERROR)
+    return GatewayError(status, message, type_=type_, code=code, retry_after=error.retry_after,
+                        counts_as_error=error.kind != BAD_REQUEST)
+
+
+def upstream_detail(request_id: str, error: ProviderError) -> str:
+    """The provider's own error (redacted), logged server-side and kept in the request log."""
+    detail = redact(str(error))[:500]
+    log.warning("request %s: upstream call failed: %s", request_id, detail)
+    return detail
 
 
 def new_request_id() -> str:
@@ -206,7 +220,7 @@ class Gateway:
             raise
         except ProviderError as e:
             error = from_provider_error(e)
-            self._fail(record, error)
+            self._fail(record, error, detail=upstream_detail(record.id, e))
             raise error from e
         except Exception as e:
             log.exception("request %s failed", ctx.request_id)
@@ -214,38 +228,57 @@ class Gateway:
             self._fail(record, error, detail=f"{type(e).__name__}: {e}")
             raise error from e
         finally:
-            record.latency_ms = round((time.perf_counter() - started) * 1000, 2)
-            self._totals(record)
-            try:
-                self.store.log_request(record)
-            except Exception:
-                log.exception("could not log request %s", record.id)
-            if self.alerts is not None:
-                try:
-                    self.alerts.maybe_check()
-                except Exception:
-                    log.exception("alert check failed")
+            self._finish(record, started)
 
     async def stream(
         self, request: ChatRequest, ctx: RequestContext, expose_metadata: bool = True
     ) -> tuple[AsyncIterator[str], dict[str, str]]:
+        """Start a streamed answer: (SSE events, headers).
+
+        A request that fails before its first chunk (invalid parameters, unknown model, budget, every
+        provider failing, storage errors) raises a GatewayError and is logged here, once. A stream that
+        started is logged once by its event generator when it ends.
+        """
         started = time.perf_counter()
         now = self.clock()
         record = RequestRecord(id=ctx.request_id, ts=iso(now), app_id=ctx.app_id, requested_model=request.model,
                                stream=True)
+        try:
+            return await self._open_stream(request, ctx, record, now, started, expose_metadata)
+        except GatewayError as e:
+            if record.http_status is None:  # not recorded yet by the provider-failure paths
+                self._fail(record, e)
+            self._finish(record, started)
+            raise
+        except ProviderError as e:
+            error = from_provider_error(e)
+            self._fail(record, error, detail=upstream_detail(record.id, e))
+            self._finish(record, started)
+            raise error from e
+        except asyncio.CancelledError:
+            record.status, record.error_type = "error", "cancelled"
+            record.error_message = "client disconnected or request cancelled before the first chunk"
+            if record.calls and record.calls[-1].status == "ok" and record.calls[-1].latency_ms is None:
+                record.calls[-1].status, record.calls[-1].error_type = "error", "cancelled"
+            self._finish(record, started)
+            raise
+        except Exception as e:
+            log.exception("streaming request %s failed", ctx.request_id)
+            error = GatewayError(500, "internal gateway error", type_="server_error", code="internal_error")
+            self._fail(record, error, detail=f"{type(e).__name__}: {e}")
+            self._finish(record, started)
+            raise error from e
+
+    async def _open_stream(self, request: ChatRequest, ctx: RequestContext, record: RequestRecord, now: datetime,
+                           started: float, expose_metadata: bool) -> tuple[AsyncIterator[str], dict[str, str]]:
+        """Everything up to the first chunk; failures are raised for ``stream`` to log."""
         if request.n not in (None, 1):
-            err = GatewayError(400, "only n=1 is supported", param="n")
-            self._fail(record, err)
-            raise err
+            raise GatewayError(400, "only n=1 is supported", param="n")
         if request.tools or request.functions:
-            err = GatewayError(400, "tools / function calling is not supported yet", param="tools")
-            self._fail(record, err)
-            raise err
+            raise GatewayError(400, "tools / function calling is not supported yet", param="tools")
         app_messages = [m.to_dict() for m in request.messages]
         if any(m["role"] == "tool" for m in app_messages):
-            err = GatewayError(400, "tool messages are not supported yet", param="messages")
-            self._fail(record, err)
-            raise err
+            raise GatewayError(400, "tool messages are not supported yet", param="messages")
         mode, pinned = self.resolve_mode(request.model)
         notes: list[str] = []
 
@@ -256,7 +289,6 @@ class Gateway:
                      f"${budget.limit:.2f} (resets at 00:00 UTC)",
                 type_="budget_exceeded", code="budget_exceeded", retry_after=seconds_until_utc_midnight(now),
                 counts_as_error=False)
-            self._fail(record, err)
             raise err
         if budget.soft and mode in ("router", "cascade", "strong"):
             notes.append(f"over {self.budgets.config.soft_limit_fraction:.0%} of the daily budget: cheap model")
@@ -325,10 +357,7 @@ class Gateway:
                 call.error_message = str(e)[:500]
                 if e.kind == BAD_REQUEST or i == len(chain) - 1:
                     err = from_provider_error(e)
-                    self._fail(record, err)
-                    record.latency_ms = round((time.perf_counter() - started) * 1000, 2)
-                    self._totals(record)
-                    self.store.log_request(record)
+                    self._fail(record, err, detail=upstream_detail(record.id, e))
                     raise err from e
                 record.fallback = True
                 continue
@@ -341,9 +370,7 @@ class Gateway:
                     err = GatewayError(503, "upstream model stream is unavailable", type_="upstream_error",
                                        code="upstream_unavailable")
                     self._fail(record, err, detail=f"{type(e).__name__}: {e}")
-                    record.latency_ms = round((time.perf_counter() - started) * 1000, 2)
-                    self._totals(record)
-                    self.store.log_request(record)
+                    log.warning("request %s: upstream stream unreachable: %s", record.id, type(e).__name__)
                     raise err from e
                 record.fallback = True
                 continue
@@ -362,20 +389,15 @@ class Gateway:
                 if i == len(chain) - 1:
                     err = GatewayError(500, "internal gateway error", type_="server_error", code="internal_error")
                     self._fail(record, err, detail=f"{type(e).__name__}: {e}")
-                    record.latency_ms = round((time.perf_counter() - started) * 1000, 2)
-                    self._totals(record)
-                    self.store.log_request(record)
+                    log.error("request %s: internal error before the first chunk: %s: %s", record.id,
+                              type(e).__name__, e)
                     raise err from e
                 record.fallback = True
                 continue
 
         if active_gen is None:
-            err = GatewayError(503, "all providers failed to stream", type_="upstream_error", code="upstream_unavailable")
-            self._fail(record, err)
-            record.latency_ms = round((time.perf_counter() - started) * 1000, 2)
-            self._totals(record)
-            self.store.log_request(record)
-            raise err
+            raise GatewayError(503, "all providers failed to stream", type_="upstream_error",
+                               code="upstream_unavailable")
 
         if record.fallback:
             notes.append(f"fallback to {active_alias} ({active_tier}) after an error")
@@ -390,6 +412,9 @@ class Gateway:
             headers["x-gateway-tier"] = str(active_tier)
             headers["x-gateway-release"] = str(record.release or "")
 
+        spec = self.config.models[active_alias]
+        prompt_chars = sum(len(message_text(m.get("content"))) for m in messages)
+
         async def event_generator() -> AsyncIterator[str]:
             created_ts = int(now.timestamp())
             accumulated_text: list[str] = []
@@ -397,6 +422,21 @@ class Gateway:
             completion_tokens = (first_chunk and first_chunk.completion_tokens) or 0
             cost_usd = first_chunk and first_chunk.provider_cost_usd
             last_call = record.calls[-1]
+
+            def account(finished: bool) -> None:
+                """Tokens and cost of this call: the provider's usage when it sent any, otherwise estimates
+                (about 4 characters per token). A stream that stops early is charged for what it produced."""
+                nonlocal prompt_tokens, completion_tokens, cost_usd
+                produced = "".join(accumulated_text)
+                if prompt_tokens == 0:
+                    prompt_tokens = max(1, prompt_chars // 4)
+                if completion_tokens == 0 and (finished or produced):
+                    completion_tokens = max(1, len(produced) // 4)
+                if cost_usd is None:
+                    cost_usd = spec.cost(prompt_tokens, completion_tokens)
+                last_call.prompt_tokens = prompt_tokens
+                last_call.completion_tokens = completion_tokens
+                last_call.cost_usd = cost_usd
 
             try:
                 if first_chunk is not None:
@@ -442,20 +482,7 @@ class Gateway:
                     }
                     yield f"data: {json.dumps(payload)}\n\n"
 
-                total_text = "".join(accumulated_text)
-                if prompt_tokens == 0:
-                    prompt_chars = sum(len(message_text(m.get("content"))) for m in messages)
-                    prompt_tokens = max(1, prompt_chars // 4)
-                if completion_tokens == 0:
-                    completion_tokens = max(1, len(total_text) // 4)
-
-                spec = self.config.models[active_alias]
-                if cost_usd is None:
-                    cost_usd = spec.cost(prompt_tokens, completion_tokens)
-
-                last_call.prompt_tokens = prompt_tokens
-                last_call.completion_tokens = completion_tokens
-                last_call.cost_usd = cost_usd
+                account(finished=True)
                 last_call.status = "ok"
 
                 record.prompt_tokens = prompt_tokens
@@ -492,6 +519,7 @@ class Gateway:
                 yield "data: [DONE]\n\n"
 
             except (asyncio.CancelledError, GeneratorExit):
+                account(finished=False)
                 last_call.status = "error"
                 last_call.error_type = "cancelled"
                 last_call.error_message = "client disconnected or request cancelled"
@@ -500,13 +528,16 @@ class Gateway:
                 record.error_message = "client disconnected or request cancelled"
                 raise
             except Exception as e:
+                account(finished=False)
+                detail = redact(str(e))[:500]
+                log.warning("request %s: stream failed after the first chunk: %s", record.id, detail)
                 last_call.status = "error"
                 last_call.error_type = e.kind if isinstance(e, ProviderError) else type(e).__name__
-                last_call.error_message = str(e)[:500]
+                last_call.error_message = detail
                 record.status = "error"
                 record.http_status = 200
                 record.error_type = "stream_failed"
-                record.error_message = str(e)[:500]
+                record.error_message = detail
 
                 safe_err = {
                     "error": {
@@ -518,17 +549,7 @@ class Gateway:
                 yield f"data: {json.dumps(safe_err)}\n\n"
                 yield "data: [DONE]\n\n"
             finally:
-                record.latency_ms = round((time.perf_counter() - started) * 1000, 2)
-                self._totals(record)
-                try:
-                    self.store.log_request(record)
-                except Exception:
-                    log.exception("could not log streaming request %s", record.id)
-                if self.alerts is not None:
-                    try:
-                        self.alerts.maybe_check()
-                    except Exception:
-                        log.exception("alert check failed")
+                self._finish(record, started)
                 await active_gen.aclose()
 
         return event_generator(), headers
@@ -679,6 +700,22 @@ class Gateway:
         record.prompt_tokens = sum(c.prompt_tokens for c in record.calls)
         record.completion_tokens = sum(c.completion_tokens for c in record.calls)
         record.cost_usd = sum(c.cost_usd for c in record.calls)
+
+    def _finish(self, record: RequestRecord, started: float) -> None:
+        """Log a finished request (once) and check alerts. Neither may break the response: a storage or
+        alert failure goes to the gateway's log, with what the lost row would have said."""
+        record.latency_ms = round((time.perf_counter() - started) * 1000, 2)
+        self._totals(record)
+        try:
+            self.store.log_request(record)
+        except Exception:
+            log.exception("could not log request %s (status %s, http %s, error %s, cost $%.8f)", record.id,
+                          record.status, record.http_status, record.error_type, record.cost_usd)
+        if self.alerts is not None:
+            try:
+                self.alerts.maybe_check()
+            except Exception:
+                log.exception("alert check failed")
 
     @staticmethod
     def _fail(record: RequestRecord, error: GatewayError, detail: str | None = None) -> None:

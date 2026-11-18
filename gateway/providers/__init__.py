@@ -38,7 +38,26 @@ from gateway.providers.base import (
 )
 from gateway.ratelimit import RateLimited, RateLimiter, estimate_tokens
 
-__all__ = ["Completion", "ModelRegistry", "Provider", "ProviderError", "StreamChunk", "build_providers"]
+__all__ = ["Completion", "ModelRegistry", "Provider", "ProviderError", "StreamChunk", "build_providers",
+           "stream_tokens"]
+
+
+def stream_tokens(prompt_chars: int, streamed_chars: int, usage_prompt: int | None, usage_completion: int | None,
+                  produced: bool) -> int:
+    """Tokens a stream used, for the per-minute limit.
+
+    The provider's usage when it sent it (never added to an estimate), otherwise ~4 characters per token as in
+    ``estimate_tokens``: the prompt, plus at least one token for any streamed text. A stream that produced
+    nothing and reported no usage (it failed before its first chunk) counts 0, like a failed ``complete``.
+    """
+    if not produced and usage_prompt is None and usage_completion is None:
+        return 0
+    prompt = usage_prompt if usage_prompt is not None else prompt_chars // 4
+    if usage_completion is not None:
+        completion = usage_completion
+    else:
+        completion = max(1, streamed_chars // 4) if streamed_chars else 0
+    return max(0, prompt) + max(0, completion)
 
 
 def build_providers(config: GatewayConfig, *, fake: bool = False) -> dict[str, Provider]:
@@ -182,13 +201,18 @@ class ModelRegistry:
                     raise
 
                 upstream_gen = provider.stream(spec.model, messages, merged)
-                tokens_produced = 0
+                usage_prompt: int | None = None
+                usage_completion: int | None = None
+                streamed_chars = 0
                 first_chunk_yielded = False
                 try:
                     try:
                         async for chunk in upstream_gen:
-                            if chunk.completion_tokens:
-                                tokens_produced = (chunk.prompt_tokens or 0) + chunk.completion_tokens
+                            if chunk.prompt_tokens is not None:
+                                usage_prompt = chunk.prompt_tokens
+                            if chunk.completion_tokens is not None:
+                                usage_completion = chunk.completion_tokens
+                            streamed_chars += len(chunk.text or "")
                             first_chunk_yielded = True
                             yield chunk
                     except BaseException as e:
@@ -214,7 +238,8 @@ class ModelRegistry:
                         breaker.record_success(token)
                         return
                 finally:
-                    limiter.settle(reservation, tokens_produced)
+                    limiter.settle(reservation, stream_tokens(chars, streamed_chars, usage_prompt, usage_completion,
+                                                              first_chunk_yielded))
                     await upstream_gen.aclose()
         finally:
             if not settled:
