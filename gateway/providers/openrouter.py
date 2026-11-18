@@ -25,6 +25,7 @@ from gateway.providers.base import (
     TIMEOUT,
     Completion,
     ProviderError,
+    StreamChunk,
     redact,
 )
 from gateway.providers.openai_compat import OpenAICompatibleProvider, parse_response
@@ -76,3 +77,22 @@ class OpenRouterProvider(OpenAICompatibleProvider):
         completion.provider_cost_usd = float(cost) if isinstance(cost, int | float) else None
         completion.served_by = data.get("provider")
         return completion
+
+    def parse_chunk(self, data: dict[str, Any], model: str) -> StreamChunk | None:
+        error = data.get("error")
+        choices = data.get("choices") or []
+        if not error and choices and isinstance(choices[0], dict):
+            error = choices[0].get("error")
+        if isinstance(error, dict):
+            code = error.get("code")
+            kind = _BODY_ERRORS.get(code, OTHER) if isinstance(code, int) else OTHER
+            raise ProviderError(f"OpenRouter error {code}: {redact(str(error.get('message', ''))[:500])}", kind=kind,
+                                status=code if isinstance(code, int) else None)
+        chunk = super().parse_chunk(data, model)
+        if chunk is not None:
+            usage = data.get("usage") or {}
+            cost = usage.get("cost")
+            if isinstance(cost, int | float):
+                chunk.provider_cost_usd = float(cost)
+            chunk.served_by = data.get("provider")
+        return chunk

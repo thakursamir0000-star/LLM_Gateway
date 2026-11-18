@@ -19,14 +19,18 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import random
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
+
+import httpx
 
 from gateway.config import GatewayConfig, Release
 from gateway.manage.budgets import BudgetPolicy, seconds_until_utc_midnight
@@ -43,6 +47,7 @@ from gateway.providers.base import (
     TIMEOUT,
     Completion,
     ProviderError,
+    message_text,
 )
 from gateway.routing import Router, choose_tier, routing_text
 from gateway.routing.cascade import check_answer, should_escalate
@@ -118,8 +123,8 @@ class ChatResult:
         return {"prompt_tokens": self.prompt_tokens, "completion_tokens": self.completion_tokens,
                 "total_tokens": self.prompt_tokens + self.completion_tokens}
 
-    def to_openai(self) -> dict[str, Any]:
-        return {
+    def to_openai(self, expose_metadata: bool = True) -> dict[str, Any]:
+        data = {
             "id": self.request_id,
             "object": "chat.completion",
             "created": self.created,
@@ -127,10 +132,12 @@ class ChatResult:
             "choices": [{"index": 0, "message": {"role": "assistant", "content": self.text},
                          "finish_reason": self.finish_reason, "logprobs": None}],
             "usage": self.usage,
-            "gateway": self.gateway,
         }
+        if expose_metadata:
+            data["gateway"] = self.gateway
+        return data
 
-    def to_chunks(self, include_usage: bool = False) -> list[dict[str, Any]]:
+    def to_chunks(self, include_usage: bool = False, expose_metadata: bool = True) -> list[dict[str, Any]]:
         """The answer as ``chat.completion.chunk`` objects (sent once the model has finished)."""
         base = {"id": self.request_id, "object": "chat.completion.chunk", "created": self.created,
                 "model": self.model}
@@ -140,12 +147,18 @@ class ChatResult:
             {**base, "choices": [{"index": 0, "delta": {}, "finish_reason": self.finish_reason}]},
         ]
         if include_usage:
-            chunks.append({**base, "choices": [], "usage": self.usage, "gateway": self.gateway})
+            chunk = {**base, "choices": [], "usage": self.usage}
+            if expose_metadata:
+                chunk["gateway"] = self.gateway
+            chunks.append(chunk)
         return chunks
 
-    def headers(self) -> dict[str, str]:
+    def headers(self, expose_metadata: bool = True) -> dict[str, str]:
+        base = {"x-gateway-request-id": self.request_id}
+        if not expose_metadata:
+            return base
         return {
-            "x-gateway-request-id": self.request_id,
+            **base,
             "x-gateway-model": str(self.gateway.get("model")),
             "x-gateway-tier": str(self.gateway.get("tier")),
             "x-gateway-release": str(self.gateway.get("release")),
@@ -212,6 +225,313 @@ class Gateway:
                     self.alerts.maybe_check()
                 except Exception:
                     log.exception("alert check failed")
+
+    async def stream(
+        self, request: ChatRequest, ctx: RequestContext, expose_metadata: bool = True
+    ) -> tuple[AsyncIterator[str], dict[str, str]]:
+        started = time.perf_counter()
+        now = self.clock()
+        record = RequestRecord(id=ctx.request_id, ts=iso(now), app_id=ctx.app_id, requested_model=request.model,
+                               stream=True)
+        if request.n not in (None, 1):
+            err = GatewayError(400, "only n=1 is supported", param="n")
+            self._fail(record, err)
+            raise err
+        if request.tools or request.functions:
+            err = GatewayError(400, "tools / function calling is not supported yet", param="tools")
+            self._fail(record, err)
+            raise err
+        app_messages = [m.to_dict() for m in request.messages]
+        if any(m["role"] == "tool" for m in app_messages):
+            err = GatewayError(400, "tool messages are not supported yet", param="messages")
+            self._fail(record, err)
+            raise err
+        mode, pinned = self.resolve_mode(request.model)
+        notes: list[str] = []
+
+        budget = self.budgets.status(ctx.app_id, self.store.app_spend(ctx.app_id, record.day))
+        if budget.exceeded:
+            err = GatewayError(
+                429, f"daily budget for app {ctx.app_id!r} is used up: ${budget.spent:.4f} of "
+                     f"${budget.limit:.2f} (resets at 00:00 UTC)",
+                type_="budget_exceeded", code="budget_exceeded", retry_after=seconds_until_utc_midnight(now),
+                counts_as_error=False)
+            self._fail(record, err)
+            raise err
+        if budget.soft and mode in ("router", "cascade", "strong"):
+            notes.append(f"over {self.budgets.config.soft_limit_fraction:.0%} of the daily budget: cheap model")
+            mode = "cheap"
+
+        release_name, canary = self.releases.pick(self.releases.state(), request.user, self.rng)
+        release = self.config.releases[release_name]
+        record.release, record.canary, record.prompt_version = release_name, canary, release.prompt
+        system_prompt = self.config.prompts[release.prompt]
+        messages = ([{"role": "system", "content": system_prompt}] if system_prompt else []) + app_messages
+
+        latency = self.config.latency.class_for(ctx.app_id, ctx.latency)
+        classifier = mode == "router" and self.router.name == "classifier"
+        default_threshold = (self.config.routing.classifier_threshold if classifier
+                             else self.config.routing.threshold)
+        threshold = default_threshold if ctx.threshold is None else ctx.threshold
+        record.mode, record.threshold, record.latency_class = ("pinned" if pinned else mode), threshold, latency
+        if pinned:
+            tier = "pinned"
+        elif mode == "router":
+            expected = (release.model_for("cheap", latency), release.model_for("strong", latency))
+            trained = getattr(self.router, "model_aliases", None)
+            if classifier and trained != expected:
+                record.router = self.router.name
+                notes.append(
+                    f"classifier trained for {trained}; release {release_name} {latency} uses {expected}: strong model"
+                )
+                tier = "strong"
+            else:
+                t = time.perf_counter()
+                score = self.router.score(app_messages)
+                record.router_ms = round((time.perf_counter() - t) * 1000, 3)
+                record.router, record.route_score = score.router, score.score
+                notes.append(score.reason)
+                tier = choose_tier(score.score, threshold)
+        else:
+            tier = "cheap" if mode == "cascade" else mode
+        alias = pinned or release.model_for(tier, latency)
+        params = request.params()
+
+        allow_fallback = not pinned and (self.config.routing.fallback_on_error or mode == "cascade")
+        chain = self.fallback_chain(tier, alias, release, latency) if allow_fallback else [(tier, alias)]
+
+        active_gen = None
+        active_tier = None
+        active_alias = None
+        first_chunk = None
+
+        for i, (step_tier, step_alias) in enumerate(chain):
+            spec = self.config.models[step_alias]
+            call = CallRecord(seq=len(record.calls) + 1, tier=step_tier, model=step_alias, provider_model=spec.model)
+            record.calls.append(call)
+            t_call = time.perf_counter()
+            try:
+                upstream_gen = self.registry.stream(step_alias, messages, params)
+                first_chunk = await anext(upstream_gen)
+                call.latency_ms = round((time.perf_counter() - t_call) * 1000, 2)
+                active_gen = upstream_gen
+                active_tier = step_tier
+                active_alias = step_alias
+                break
+            except ProviderError as e:
+                call.latency_ms = round((time.perf_counter() - t_call) * 1000, 2)
+                call.status = "error"
+                call.error_type = e.kind
+                call.error_message = str(e)[:500]
+                if e.kind == BAD_REQUEST or i == len(chain) - 1:
+                    err = from_provider_error(e)
+                    self._fail(record, err)
+                    record.latency_ms = round((time.perf_counter() - started) * 1000, 2)
+                    self._totals(record)
+                    self.store.log_request(record)
+                    raise err from e
+                record.fallback = True
+                continue
+            except httpx.TransportError as e:
+                call.latency_ms = round((time.perf_counter() - t_call) * 1000, 2)
+                call.status = "error"
+                call.error_type = OVERLOADED
+                call.error_message = f"{type(e).__name__}: {e}"[:500]
+                if i == len(chain) - 1:
+                    err = GatewayError(503, "upstream model stream is unavailable", type_="upstream_error",
+                                       code="upstream_unavailable")
+                    self._fail(record, err, detail=f"{type(e).__name__}: {e}")
+                    record.latency_ms = round((time.perf_counter() - started) * 1000, 2)
+                    self._totals(record)
+                    self.store.log_request(record)
+                    raise err from e
+                record.fallback = True
+                continue
+            except StopAsyncIteration:
+                call.latency_ms = round((time.perf_counter() - t_call) * 1000, 2)
+                active_gen = upstream_gen
+                active_tier = step_tier
+                active_alias = step_alias
+                first_chunk = None
+                break
+            except Exception as e:
+                call.latency_ms = round((time.perf_counter() - t_call) * 1000, 2)
+                call.status = "error"
+                call.error_type = "internal"
+                call.error_message = str(e)[:500]
+                if i == len(chain) - 1:
+                    err = GatewayError(500, "internal gateway error", type_="server_error", code="internal_error")
+                    self._fail(record, err, detail=f"{type(e).__name__}: {e}")
+                    record.latency_ms = round((time.perf_counter() - started) * 1000, 2)
+                    self._totals(record)
+                    self.store.log_request(record)
+                    raise err from e
+                record.fallback = True
+                continue
+
+        if active_gen is None:
+            err = GatewayError(503, "all providers failed to stream", type_="upstream_error", code="upstream_unavailable")
+            self._fail(record, err)
+            record.latency_ms = round((time.perf_counter() - started) * 1000, 2)
+            self._totals(record)
+            self.store.log_request(record)
+            raise err
+
+        if record.fallback:
+            notes.append(f"fallback to {active_alias} ({active_tier}) after an error")
+
+        provider_model = (first_chunk and first_chunk.model) or self.config.models[active_alias].model
+        record.tier, record.model, record.provider_model = active_tier, active_alias, provider_model
+        record.route_reason = "; ".join(notes)[:500] or None
+
+        headers = {"x-gateway-request-id": record.id}
+        if expose_metadata:
+            headers["x-gateway-model"] = str(active_alias)
+            headers["x-gateway-tier"] = str(active_tier)
+            headers["x-gateway-release"] = str(record.release or "")
+
+        async def event_generator() -> AsyncIterator[str]:
+            created_ts = int(now.timestamp())
+            accumulated_text: list[str] = []
+            prompt_tokens = (first_chunk and first_chunk.prompt_tokens) or 0
+            completion_tokens = (first_chunk and first_chunk.completion_tokens) or 0
+            cost_usd = first_chunk and first_chunk.provider_cost_usd
+            last_call = record.calls[-1]
+
+            try:
+                if first_chunk is not None:
+                    if first_chunk.text:
+                        accumulated_text.append(first_chunk.text)
+                    first_payload = {
+                        "id": record.id,
+                        "object": "chat.completion.chunk",
+                        "created": created_ts,
+                        "model": provider_model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"role": "assistant", "content": first_chunk.text},
+                                "finish_reason": first_chunk.finish_reason,
+                            }
+                        ],
+                    }
+                    yield f"data: {json.dumps(first_payload)}\n\n"
+
+                async for chunk in active_gen:
+                    if chunk.text:
+                        accumulated_text.append(chunk.text)
+                    if chunk.prompt_tokens is not None:
+                        prompt_tokens = chunk.prompt_tokens
+                    if chunk.completion_tokens is not None:
+                        completion_tokens = chunk.completion_tokens
+                    if chunk.provider_cost_usd is not None:
+                        cost_usd = chunk.provider_cost_usd
+
+                    payload = {
+                        "id": record.id,
+                        "object": "chat.completion.chunk",
+                        "created": created_ts,
+                        "model": provider_model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": chunk.text} if chunk.text else {},
+                                "finish_reason": chunk.finish_reason,
+                            }
+                        ],
+                    }
+                    yield f"data: {json.dumps(payload)}\n\n"
+
+                total_text = "".join(accumulated_text)
+                if prompt_tokens == 0:
+                    prompt_chars = sum(len(message_text(m.get("content"))) for m in messages)
+                    prompt_tokens = max(1, prompt_chars // 4)
+                if completion_tokens == 0:
+                    completion_tokens = max(1, len(total_text) // 4)
+
+                spec = self.config.models[active_alias]
+                if cost_usd is None:
+                    cost_usd = spec.cost(prompt_tokens, completion_tokens)
+
+                last_call.prompt_tokens = prompt_tokens
+                last_call.completion_tokens = completion_tokens
+                last_call.cost_usd = cost_usd
+                last_call.status = "ok"
+
+                record.prompt_tokens = prompt_tokens
+                record.completion_tokens = completion_tokens
+                record.cost_usd = cost_usd
+                record.status = "ok"
+                record.http_status = 200
+
+                include_usage = bool(request.stream_options and request.stream_options.include_usage)
+                if include_usage:
+                    usage_payload = {
+                        "id": record.id,
+                        "object": "chat.completion.chunk",
+                        "created": created_ts,
+                        "model": provider_model,
+                        "choices": [],
+                        "usage": {
+                            "prompt_tokens": prompt_tokens,
+                            "completion_tokens": completion_tokens,
+                            "total_tokens": prompt_tokens + completion_tokens,
+                        },
+                    }
+                    if expose_metadata:
+                        usage_payload["gateway"] = {
+                            "request_id": record.id, "app_id": record.app_id, "release": record.release,
+                            "canary": record.canary, "prompt_version": record.prompt_version, "mode": record.mode,
+                            "router": record.router, "route_score": record.route_score, "threshold": threshold,
+                            "latency_class": latency, "tier": active_tier, "model": active_alias,
+                            "escalated": record.escalated, "fallback": record.fallback, "cost_usd": round(cost_usd, 8),
+                            "router_ms": record.router_ms, "reason": record.route_reason,
+                        }
+                    yield f"data: {json.dumps(usage_payload)}\n\n"
+
+                yield "data: [DONE]\n\n"
+
+            except (asyncio.CancelledError, GeneratorExit):
+                last_call.status = "error"
+                last_call.error_type = "cancelled"
+                last_call.error_message = "client disconnected or request cancelled"
+                record.status = "error"
+                record.error_type = "cancelled"
+                record.error_message = "client disconnected or request cancelled"
+                raise
+            except Exception as e:
+                last_call.status = "error"
+                last_call.error_type = e.kind if isinstance(e, ProviderError) else type(e).__name__
+                last_call.error_message = str(e)[:500]
+                record.status = "error"
+                record.http_status = 200
+                record.error_type = "stream_failed"
+                record.error_message = str(e)[:500]
+
+                safe_err = {
+                    "error": {
+                        "message": "upstream stream failed",
+                        "type": "upstream_error",
+                        "code": "stream_failed",
+                    }
+                }
+                yield f"data: {json.dumps(safe_err)}\n\n"
+                yield "data: [DONE]\n\n"
+            finally:
+                record.latency_ms = round((time.perf_counter() - started) * 1000, 2)
+                self._totals(record)
+                try:
+                    self.store.log_request(record)
+                except Exception:
+                    log.exception("could not log streaming request %s", record.id)
+                if self.alerts is not None:
+                    try:
+                        self.alerts.maybe_check()
+                    except Exception:
+                        log.exception("alert check failed")
+                await active_gen.aclose()
+
+        return event_generator(), headers
 
     async def _run(self, request: ChatRequest, ctx: RequestContext, record: RequestRecord,
                    now: datetime) -> ChatResult:

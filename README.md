@@ -117,10 +117,13 @@ streamlit run dashboard/app.py
 ```
 
 **With real models**: copy `.env.example` to `.env`, set `GROQ_API_KEY` (plus `OPENROUTER_API_KEY` for the
-`or-*` models and `GEMINI_API_KEY` for Gemini/Gemma), then `python -m gateway`. The gateway listens on `http://127.0.0.1:8000` (`GATEWAY_HOST`, `GATEWAY_PORT`).
+`or-*` models and `GEMINI_API_KEY` for Gemini/Gemma), and configure `GATEWAY_API_KEYS="my-app:my-secret-key"`, then `python -m gateway`. The gateway listens on `http://127.0.0.1:8000` (`GATEWAY_HOST`, `GATEWAY_PORT`).
 
 ```bash
-curl http://127.0.0.1:8000/v1/chat/completions -H "Content-Type: application/json" -H "X-App-Id: my-app" -d '{"model": "auto", "messages": [{"role": "user", "content": "Explain step by step why the sky is blue."}]}'
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer my-secret-key" \
+  -d '{"model": "auto", "messages": [{"role": "user", "content": "Explain step by step why the sky is blue."}]}'
 ```
 
 **Docker** (gateway on :8000, dashboard on :8501, sharing the request log in a volume):
@@ -238,12 +241,36 @@ python -m gateway.manage activate v4-latency
 python -m gateway.manage activate v1
 ```
 
+## Security and Client Migration
+
+Phase 1 security hardening enforces production-safe defaults:
+
+- **Fail-Closed Client Authentication**: By default (`auth.allow_anonymous: false`), `/v1/chat/completions` and
+  `/v1/feedback` require a valid bearer key configured in `GATEWAY_API_KEYS="app1:key1,app2:key2"`. Unauthenticated
+  calls receive `HTTP 401 Unauthorized` (`auth_required`).
+  - *Client Migration*: Any client calling the gateway must supply `Authorization: Bearer <key>`. For local development
+    or offline demos where anonymous access via `X-App-Id` is desired, explicitly set `GATEWAY_ALLOW_ANONYMOUS=1` or
+    `auth.allow_anonymous: true` in the configuration.
+- **Internal Metadata Protection**: By default (`security.expose_internal_metadata: false`), response payloads contain
+  standard OpenAI-compatible fields (`id`, `object`, `created`, `model`, `choices`, `usage`). The custom `gateway`
+  diagnostic dictionary and internal headers (`x-gateway-model`, `x-gateway-tier`, `x-gateway-release`,
+  `x-gateway-cost-usd`) are omitted to prevent leaking internal routing strategies, prompt versions, and vendor costs.
+  Only `x-gateway-request-id` is returned. Set `GATEWAY_EXPOSE_METADATA=1` in debug/test environments to re-enable them.
+  `X-Admin-Key` is strictly reserved for `/admin/*` endpoints and never used to authorize diagnostic metadata on chat routes.
+- **Request Body Size Limits**: Inbound payloads are capped by `security.max_request_body_bytes` (default `10485760` / 10MB;
+  override with `GATEWAY_MAX_BODY_BYTES`). Payloads exceeding this limit (via `Content-Length` or streamed chunk accumulation)
+  are rejected immediately with `HTTP 413 Payload Too Large` (`payload_too_large`).
+- **Restrictive CORS**: Cross-origin browser access is disabled by default (`security.cors_origins: []`). Specify allowed
+  domains via `GATEWAY_CORS_ORIGINS="https://app.example.com,https://dashboard.example.com"`.
+- **Fail-Closed Admin API**: Admin endpoints (`/admin/*`) require `X-Admin-Key: <key>`. If `GATEWAY_ADMIN_KEY` is not set,
+  the endpoints fail closed with `HTTP 403 Forbidden` (`admin_disabled`).
+
 ## Budgets, feedback and alerts
 
 - **Budgets**: `budgets.default_daily_usd` and per-app `budgets.apps.<app>.daily_usd` (USD per UTC day, from the list
-  prices in the config). An app is identified by its bearer key when `GATEWAY_API_KEYS="app:key,..."` is set, otherwise
-  by the `X-App-Id` header. A request's cost is known only after it runs, so an app can overshoot by the requests in
-  flight.
+  prices in the config). An app is identified by its bearer key when `GATEWAY_API_KEYS="app:key,..."` is set, or
+  by the `X-App-Id` header when anonymous access is explicitly enabled. A request's cost is known only after it runs,
+  so an app can overshoot by the requests in flight.
 - **Feedback**: `POST /v1/feedback {"request_id": "<response id>", "score": "up" | "down" | 1 | -1, "comment": "..."}`.
 - **Alerts**: error rate over the last `window_minutes` (with at least `min_requests`) above `alerts.error_rate`, or
   today's cost above `alerts.daily_cost_usd`. Each alert is logged, stored (the dashboard shows it), and POSTed as JSON

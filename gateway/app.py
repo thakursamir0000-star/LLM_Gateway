@@ -8,7 +8,6 @@ gateway by changing its base URL to ``http://<host>:8000/v1``.
 from __future__ import annotations
 
 import hmac
-import json
 import math
 import os
 import random
@@ -87,6 +86,57 @@ def create_app(config: GatewayConfig | None = None, *, providers: dict[str, Prov
                   description="OpenAI-compatible gateway with cost/quality routing and request monitoring.")
     app.state.gateway = gateway
 
+    if config.security.cors_origins:
+        from fastapi.middleware.cors import CORSMiddleware
+
+        allow_all = "*" in config.security.cors_origins
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=config.security.cors_origins,
+            allow_credentials=not allow_all,
+            allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+            allow_headers=["*"],
+        )
+
+    @app.middleware("http")
+    async def enforce_body_size_limit(request: Request, call_next):
+        max_bytes = config.security.max_request_body_bytes
+        content_length = request.headers.get("content-length")
+        if content_length:
+            try:
+                if int(content_length) > max_bytes:
+                    err = GatewayError(413, f"request payload too large ({content_length} bytes > {max_bytes} bytes limit)",
+                                       code="payload_too_large")
+                    return JSONResponse(err.body(), status_code=413)
+            except ValueError:
+                pass
+
+        bytes_received = 0
+        original_receive = request._receive
+
+        async def limited_receive():
+            nonlocal bytes_received
+            message = await original_receive()
+            if message["type"] == "http.request":
+                bytes_received += len(message.get("body", b""))
+                if bytes_received > max_bytes:
+                    request.state.body_size_exceeded = True
+                    raise GatewayError(413, f"request body exceeded limit of {max_bytes} bytes",
+                                       code="payload_too_large")
+            return message
+
+        request._receive = limited_receive
+        try:
+            response = await call_next(request)
+        except GatewayError as exc:
+            return JSONResponse(exc.body(), status_code=exc.status)
+
+        if getattr(request.state, "body_size_exceeded", False):
+            err = GatewayError(413, f"request body exceeded limit of {max_bytes} bytes",
+                               code="payload_too_large")
+            return JSONResponse(err.body(), status_code=413)
+        return response
+
     # ── errors in OpenAI's format ───────────────────────────────────
     @app.exception_handler(GatewayError)
     async def gateway_error(request: Request, exc: GatewayError) -> JSONResponse:
@@ -104,6 +154,10 @@ def create_app(config: GatewayConfig | None = None, *, providers: dict[str, Prov
 
     # ── auth ────────────────────────────────────────────────────────
     def app_id_for(request: Request) -> str:
+        raw_app_id = request.headers.get("x-app-id", "").strip()
+        if raw_app_id and not _APP_ID.fullmatch(raw_app_id):
+            raise GatewayError(400, "X-App-Id must be 1-64 letters, digits, '.', '_' or '-'", param="X-App-Id")
+
         if api_keys:
             header = request.headers.get("authorization", "")
             token = header[7:].strip() if header.lower().startswith("bearer ") else ""
@@ -111,10 +165,12 @@ def create_app(config: GatewayConfig | None = None, *, providers: dict[str, Prov
                 if token and hmac.compare_digest(token, key):
                     return app_id
             raise GatewayError(401, "invalid or missing API key", code="invalid_api_key", counts_as_error=False)
-        app_id = request.headers.get("x-app-id", "").strip() or "default"
-        if not _APP_ID.fullmatch(app_id):
-            raise GatewayError(400, "X-App-Id must be 1-64 letters, digits, '.', '_' or '-'", param="X-App-Id")
-        return app_id
+
+        if not config.auth.allow_anonymous:
+            raise GatewayError(401, f"authentication required: configure {config.auth.keys_env}",
+                               code="auth_required", counts_as_error=False)
+
+        return raw_app_id or "default"
 
     def require_admin(request: Request) -> None:
         if admin_key is None:
@@ -149,17 +205,14 @@ def create_app(config: GatewayConfig | None = None, *, providers: dict[str, Prov
     async def chat_completions(body: ChatRequest, request: Request):
         ctx = RequestContext(app_id=app_id_for(request), threshold=threshold_for(request),
                              latency=latency_for(request))
-        result = await gateway.chat(body, ctx)
+        expose_meta = config.security.expose_internal_metadata
         if not body.stream:
-            return JSONResponse(result.to_openai(), headers=result.headers())
-        include_usage = bool(body.stream_options and body.stream_options.include_usage)
+            result = await gateway.chat(body, ctx)
+            return JSONResponse(result.to_openai(expose_metadata=expose_meta),
+                                headers=result.headers(expose_metadata=expose_meta))
 
-        async def events() -> AsyncIterator[str]:
-            for chunk in result.to_chunks(include_usage):
-                yield f"data: {json.dumps(chunk)}\n\n"
-            yield "data: [DONE]\n\n"
-
-        return StreamingResponse(events(), media_type="text/event-stream", headers=result.headers())
+        generator, headers = await gateway.stream(body, ctx, expose_metadata=expose_meta)
+        return StreamingResponse(generator, media_type="text/event-stream", headers=headers)
 
     @app.get("/v1/models")
     async def list_models() -> dict[str, Any]:
@@ -187,7 +240,7 @@ def create_app(config: GatewayConfig | None = None, *, providers: dict[str, Prov
                 "classifier_threshold": config.routing.classifier_threshold,
                 "latency_default": config.latency.default,
                 "router": router.description, "fake_providers": fake,
-                "auth": "api_keys" if api_keys else "x-app-id"}
+                "auth": "api_keys" if api_keys else ("x-app-id" if config.auth.allow_anonymous else "fail_closed")}
 
     # ── admin ───────────────────────────────────────────────────────
     def deployment_view() -> dict[str, Any]:

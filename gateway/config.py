@@ -114,6 +114,12 @@ class RetryConfig(_Strict):
     quota_cooldown_s: float = Field(300.0, ge=0)
 
 
+class CircuitBreakerConfig(_Strict):
+    failure_threshold: int = Field(5, ge=1)
+    recovery_timeout_s: float = Field(30.0, ge=0)
+    half_open_probes: int = Field(1, ge=1)
+
+
 class LatencyConfig(_Strict):
     """Which latency class a request is in when it doesn't say (X-Gateway-Latency)."""
 
@@ -146,6 +152,13 @@ class AlertConfig(_Strict):
 class AuthConfig(_Strict):
     keys_env: str = "GATEWAY_API_KEYS"
     admin_key_env: str = "GATEWAY_ADMIN_KEY"
+    allow_anonymous: bool = False
+
+
+class SecurityConfig(_Strict):
+    max_request_body_bytes: int = Field(10 * 1024 * 1024, ge=1024)
+    cors_origins: list[str] = Field(default_factory=list)
+    expose_internal_metadata: bool = False
 
 
 class StorageConfig(_Strict):
@@ -161,9 +174,11 @@ class GatewayConfig(_Strict):
     routing: RoutingConfig = Field(default_factory=RoutingConfig)
     latency: LatencyConfig = Field(default_factory=LatencyConfig)
     retries: RetryConfig = Field(default_factory=RetryConfig)
+    circuit_breaker: CircuitBreakerConfig = Field(default_factory=CircuitBreakerConfig)
     budgets: BudgetConfig = Field(default_factory=BudgetConfig)
     alerts: AlertConfig = Field(default_factory=AlertConfig)
     auth: AuthConfig = Field(default_factory=AuthConfig)
+    security: SecurityConfig = Field(default_factory=SecurityConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)
 
     @model_validator(mode="after")
@@ -214,4 +229,19 @@ def load_config(path: str | Path | None = None) -> GatewayConfig:
     db = os.environ.get("GATEWAY_DB")
     if db:
         config.storage.db_path = db
+    allow_anon = os.environ.get("GATEWAY_ALLOW_ANONYMOUS")
+    if allow_anon is not None:
+        config.auth.allow_anonymous = allow_anon.strip().lower() in ("1", "true", "yes", "on")
+    max_bytes = os.environ.get("GATEWAY_MAX_BODY_BYTES")
+    if max_bytes:
+        try:
+            config.security.max_request_body_bytes = int(max_bytes)
+        except ValueError:
+            pass
+    cors = os.environ.get("GATEWAY_CORS_ORIGINS")
+    if cors is not None:
+        config.security.cors_origins = [o.strip() for o in cors.split(",") if o.strip()]
+    expose_meta = os.environ.get("GATEWAY_EXPOSE_METADATA")
+    if expose_meta is not None:
+        config.security.expose_internal_metadata = expose_meta.strip().lower() in ("1", "true", "yes", "on")
     return config

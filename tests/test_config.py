@@ -1,4 +1,5 @@
 import pytest
+import yaml
 from pydantic import ValidationError
 
 from gateway.config import DEFAULT_CONFIG, ROOT, load_config, resolve_path
@@ -12,6 +13,25 @@ def test_shipped_config_is_valid():
     assert config.models[release.cheap].model == "openai/gpt-oss-20b"
     assert config.models[release.strong].model == "openai/gpt-oss-120b"
     assert {"groq", "gemini"} <= set(config.providers)
+    assert config.circuit_breaker.failure_threshold == 5
+    assert config.circuit_breaker.recovery_timeout_s == 30.0
+    assert config.circuit_breaker.half_open_probes == 1
+
+
+def test_custom_circuit_breaker_values_override_defaults(tmp_path):
+    data = yaml.safe_load(DEFAULT_CONFIG.read_text(encoding="utf-8"))
+    data["circuit_breaker"] = {
+        "failure_threshold": 2,
+        "recovery_timeout_s": 7.5,
+        "half_open_probes": 3,
+    }
+    path = tmp_path / "gateway.yaml"
+    path.write_text(yaml.safe_dump(data), encoding="utf-8")
+
+    config = load_config(path)
+    assert config.circuit_breaker.failure_threshold == 2
+    assert config.circuit_breaker.recovery_timeout_s == 7.5
+    assert config.circuit_breaker.half_open_probes == 3
 
 
 def test_resolve_model_by_alias_or_provider_name(config):

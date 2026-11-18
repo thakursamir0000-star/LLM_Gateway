@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from abc import ABC, abstractmethod
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
 
@@ -33,6 +34,19 @@ class Completion:
     served_by: str | None = None  # the host that ran the model, for routers like OpenRouter
 
 
+@dataclass
+class StreamChunk:
+    """One streaming chunk normalised across providers."""
+
+    text: str = ""
+    finish_reason: str | None = None
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    model: str = ""
+    provider_cost_usd: float | None = None
+    served_by: str | None = None
+
+
 class ProviderError(Exception):
     """A failed provider call, classified so callers know whether to retry."""
 
@@ -55,6 +69,11 @@ class Provider(ABC):
     @abstractmethod
     async def complete(self, model: str, messages: list[dict[str, Any]], params: dict[str, Any]) -> Completion:
         """Run one chat completion; raise ProviderError on failure."""
+
+    async def stream(self, model: str, messages: list[dict[str, Any]], params: dict[str, Any]) -> AsyncIterator[StreamChunk]:
+        """Stream chat completion chunks; raise ProviderError on failure."""
+        raise ProviderError(f"streaming is not supported by {self.name}", kind=BAD_REQUEST, status=400)
+        yield StreamChunk()  # pragma: no cover - make it an async generator
 
     async def aclose(self) -> None:  # noqa: B027 - optional hook
         """Release network resources."""

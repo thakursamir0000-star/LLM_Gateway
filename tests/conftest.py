@@ -33,7 +33,17 @@ BASE_CONFIG: dict[str, Any] = {
     "alerts": {"error_rate": 0.5, "window_minutes": 15, "min_requests": 4, "daily_cost_usd": 0.01,
                "check_interval_s": 0, "webhook_env": "TEST_ALERT_WEBHOOK"},
     # Test-only variable names, so a developer's own GATEWAY_* settings can't change the tests.
-    "auth": {"keys_env": "TEST_GATEWAY_KEYS", "admin_key_env": "TEST_GATEWAY_ADMIN_KEY"},
+    # Isolated test compatibility settings: tests assert gateway internal metadata.
+    "auth": {
+        "keys_env": "TEST_GATEWAY_KEYS",
+        "admin_key_env": "TEST_GATEWAY_ADMIN_KEY",
+        "allow_anonymous": True,
+    },
+    "security": {
+        "max_request_body_bytes": 10485760,
+        "cors_origins": [],
+        "expose_internal_metadata": True,
+    },
 }
 
 

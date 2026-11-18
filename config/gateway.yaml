@@ -145,6 +145,14 @@ retries:
   max_wait_s: 10          # longest the gateway holds a request for a rate limit
   quota_cooldown_s: 300   # skip a model this long after a quota error (daily limit, no credits)
 
+# ── Circuit breaker ─────────────────────────────────────────────────
+# Per provider. Opens after failure_threshold qualifying failures in a row;
+# after recovery_timeout_s, half_open_probes test requests are allowed through.
+circuit_breaker:
+  failure_threshold: 5
+  recovery_timeout_s: 30.0
+  half_open_probes: 1
+
 # ── Budgets ─────────────────────────────────────────────────────────
 # Daily USD limit per app (UTC day). Over the soft limit, router/cascade/strong
 # requests go to the cheap model; at the limit, requests get HTTP 429.
@@ -167,12 +175,23 @@ alerts:
 
 # ── Auth ────────────────────────────────────────────────────────────
 # $GATEWAY_API_KEYS="app1:key1,app2:key2" turns on bearer-key auth (the key
-# names the app). Unset: the app comes from the X-App-Id header ("default").
+# names the app). By default, authentication is fail-closed (allow_anonymous: false).
 # Admin endpoints need $GATEWAY_ADMIN_KEY in the X-Admin-Key header; unset,
 # they are off (the CLI still works).
 auth:
   keys_env: GATEWAY_API_KEYS
   admin_key_env: GATEWAY_ADMIN_KEY
+  allow_anonymous: false
+
+# ── Security ────────────────────────────────────────────────────────
+# max_request_body_bytes limits the size of request payloads (default: 10MB).
+# cors_origins specifies allowed CORS origins (empty list = restrictive).
+# expose_internal_metadata controls whether internal routing diagnostics
+# and custom response headers are exposed to external clients (default: false).
+security:
+  max_request_body_bytes: 10485760
+  cors_origins: []
+  expose_internal_metadata: false
 
 storage:
   db_path: var/gateway.db

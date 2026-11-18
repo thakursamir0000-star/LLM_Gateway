@@ -11,6 +11,8 @@ OpenAI messages are converted to Gemini ``contents``:
 
 from __future__ import annotations
 
+import json
+from collections.abc import AsyncIterator
 from typing import Any
 
 import httpx
@@ -23,6 +25,7 @@ from gateway.providers.base import (
     Completion,
     Provider,
     ProviderError,
+    StreamChunk,
     classify_http_error,
     error_message,
     message_text,
@@ -129,6 +132,65 @@ class GeminiProvider(Provider):
             raise ProviderError(f"Gemini HTTP {response.status_code}: {error_message(response.text)}",
                                 kind=kind, status=response.status_code, retry_after=retry_after)
         return parse_response(response.json(), model)
+
+    async def stream(self, model: str, messages: list[dict[str, Any]], params: dict[str, Any]) -> AsyncIterator[StreamChunk]:
+        if not self._api_key:
+            raise ProviderError("GEMINI_API_KEY is not set", kind=AUTH)
+        body = build_request(model, messages, params)
+        req = self._client.build_request(
+            "POST", f"/models/{model}:streamGenerateContent?alt=sse", json=body, headers={"x-goog-api-key": self._api_key}
+        )
+        try:
+            response = await self._client.send(req, stream=True)
+        except httpx.TimeoutException as e:
+            raise ProviderError(f"Gemini timed out: {type(e).__name__}", kind=TIMEOUT) from e
+        except httpx.HTTPError as e:
+            raise ProviderError(f"Gemini unreachable: {type(e).__name__}: {e}", kind=OVERLOADED) from e
+
+        try:
+            if response.status_code >= 400:
+                body_bytes = await response.aread()
+                text = body_bytes.decode("utf-8", errors="replace")
+                kind, retry_after = classify_http_error(
+                    response.status_code, text, response.headers.get("retry-after")
+                )
+                raise ProviderError(f"Gemini HTTP {response.status_code}: {error_message(text)}",
+                                    kind=kind, status=response.status_code, retry_after=retry_after)
+
+            async for line in response.aiter_lines():
+                if not line or line.startswith(":"):
+                    continue
+                if line.startswith("data: "):
+                    raw_data = line[len("data: "):].strip()
+                    if not raw_data:
+                        continue
+                    try:
+                        data = json.loads(raw_data)
+                    except json.JSONDecodeError:
+                        continue
+                    candidates = data.get("candidates") or []
+                    usage = data.get("usageMetadata") or {}
+                    prompt_tokens = int(usage["promptTokenCount"]) if "promptTokenCount" in usage else None
+                    completion_tokens = (
+                        int(usage.get("candidatesTokenCount") or 0) + int(usage.get("thoughtsTokenCount") or 0)
+                    ) if usage else None
+                    if not candidates:
+                        yield StreamChunk(
+                            text="", finish_reason="content_filter", model=data.get("modelVersion") or model,
+                            prompt_tokens=prompt_tokens, completion_tokens=completion_tokens
+                        )
+                        continue
+                    candidate = candidates[0]
+                    parts = (candidate.get("content") or {}).get("parts") or []
+                    text = "".join(str(p.get("text", "")) for p in parts if isinstance(p, dict) and not p.get("thought"))
+                    raw_finish = candidate.get("finishReason")
+                    finish = _FINISH.get(raw_finish, "stop") if raw_finish else None
+                    yield StreamChunk(
+                        text=text, finish_reason=finish, model=data.get("modelVersion") or model,
+                        prompt_tokens=prompt_tokens, completion_tokens=completion_tokens
+                    )
+        finally:
+            await response.aclose()
 
     async def aclose(self) -> None:
         await self._client.aclose()
