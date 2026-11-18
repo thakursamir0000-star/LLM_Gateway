@@ -194,6 +194,56 @@ router requests stay on the strong model because the artifact is trained for the
 **Cascade check** (`gateway/routing/cascade.py`): no extra model call, but it only catches answers that *look* wrong;
 a confident wrong answer passes. The evaluation measures how much that matters.
 
+## Streaming and circuit breakers
+
+### Streaming
+
+`stream: true` streams the answer token by token as server-sent events (`text/event-stream`): each provider chunk is
+relayed as it arrives.
+
+- Every event is an OpenAI `chat.completion.chunk` (`data: {...}`); the first one carries `delta.role: "assistant"`.
+  With `stream_options: {"include_usage": true}` a last chunk with empty `choices` carries `usage` (and the `gateway`
+  object when `GATEWAY_EXPOSE_METADATA=1`). The stream ends with `data: [DONE]`.
+- Providers stream natively: Groq and OpenRouter through their OpenAI-compatible SSE (`stream: true`, usage
+  requested; OpenRouter also reports the cost), the Gemini API through `streamGenerateContent?alt=sse`. The fake
+  providers stream too.
+- Until the first chunk arrives the request is handled like any other: cooldowns, rate limits and circuit breakers
+  apply, retryable errors are retried with backoff, and the fallback chain can move to another model or provider. A
+  failure at this point returns a normal HTTP error in OpenAI's format, because no response has started.
+- Once the first chunk has been sent, the gateway never retries or switches provider. If the upstream stream fails
+  after that, the client gets an SSE error event, `{"error": {"message": "upstream stream failed", "type":
+  "upstream_error", "code": "stream_failed"}}`, then `data: [DONE]`; the HTTP status stays 200 and the provider's
+  error text is not forwarded. A client disconnect closes the upstream stream and is logged as cancelled, with no
+  error event.
+- Tokens and cost come from the provider's usage when it reports them, otherwise from estimates (about 4 characters
+  per token, at the config's list prices). The request is logged when the stream ends.
+- In `cascade` mode a streamed answer comes from the cheap tier and is not checked or escalated.
+
+### Circuit breakers
+
+Each provider (`groq`, `openrouter`, `gemini`) has one circuit breaker (`gateway/circuit.py`), shared by its models.
+
+| State | Behaviour |
+|---|---|
+| `CLOSED` | Calls pass. Each qualifying failure adds to a count of consecutive failures and a success resets it; at `failure_threshold` the breaker opens. |
+| `OPEN` | Calls to the provider are refused at once with a 503 `overloaded` error and no upstream call, so the fallback chain moves on to the next model; with no model left the client gets HTTP 503. |
+| `HALF_OPEN` | After `recovery_timeout_s`, up to `half_open_probes` requests at a time go through as probes while the rest are still refused. After `half_open_probes` successful probes the breaker closes; a qualifying probe failure opens it again and restarts the timer. |
+
+- **Counts as a failure:** timeouts, connection and network errors, overloaded or unavailable responses, HTTP 5xx.
+- **Does not count:** 4xx client errors (bad request, auth), rate limits and daily-quota errors (the quota cooldown
+  handles those), and cancelled requests. Such an error during a probe frees the probe slot without penalty.
+- All retries of one call count as at most one failure. A stream that fails after its first chunk still counts.
+
+```yaml
+circuit_breaker:
+  failure_threshold: 5      # consecutive qualifying failures that open the breaker (default 5)
+  recovery_timeout_s: 30.0  # seconds in OPEN before probes are allowed (default 30)
+  half_open_probes: 1       # probes allowed at a time, and successful probes needed to close (default 1)
+```
+
+Breaker state lives in each gateway process's memory: it is not shown in `/health` and is not shared between
+instances.
+
 ## Releases, canary and rollback
 
 A release pins the cheap model, the strong model and the prompt version (`config/gateway.yaml`):
@@ -398,7 +448,7 @@ OpenRouter calls hit the host's rate limit and succeeded on a rerun.
 
 | Endpoint | Purpose |
 |---|---|
-| `POST /v1/chat/completions` | OpenAI chat completions (`stream` supported: the answer arrives as server-sent events once the model is done) |
+| `POST /v1/chat/completions` | OpenAI chat completions (`stream: true` streams tokens as server-sent events, see [Streaming](#streaming)) |
 | `GET /v1/models` | routing modes and configured models |
 | `POST /v1/feedback` | thumbs up/down for a request id |
 | `GET /health` | status, active release, canary, router in use |
@@ -454,8 +504,9 @@ tests/              pytest suite
   always-strong with no significant accuracy difference; the two OpenRouter models' prices are close, so routing can
   save little there, and it was trained on GSM8K and MMLU prompts only. The rule weights are hand-set, and the
   cascade check is a heuristic.
-- `stream: true` returns the answer as SSE after the model finishes; there is no token-by-token streaming yet.
+- Streaming has no retry or failover after the first chunk, so a provider failure mid-stream ends the answer early
+  (with an SSE error event), and cascade mode does not check streamed answers.
 - Text chat only: tools / function calling, images and `n > 1` are rejected with a clear 400.
 - SQLite fits one gateway instance; several instances would need a shared database (e.g. Postgres) and shared rate
-  limits.
+  limit, cooldown and circuit-breaker state.
 - Costs are list-price estimates from the config, not provider invoices.

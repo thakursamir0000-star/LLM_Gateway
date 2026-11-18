@@ -1,5 +1,7 @@
 -r requirements.txt
 pytest>=8.0
+# Runs the async tests (streaming, circuit breaker); asyncio_mode = auto in pyproject.toml
+pytest-asyncio>=1.0
 ruff==0.8.6
 # Used only by tests: parity check of the numpy logistic regression, and the eval chart
 scikit-learn>=1.4

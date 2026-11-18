@@ -36,10 +36,23 @@ jobs:
         run: docker build -t llm-gateway:ci .
       - name: Smoke-test the gateway with fake providers
         run: |
-          docker run -d --name gateway -p 8000:8000 -e GATEWAY_FAKE_PROVIDERS=1 llm-gateway:ci
+          # Auth is fail-closed, so the job makes a throwaway bearer key for itself. Fake providers make no API calls.
+          CI_KEY="ci-$(openssl rand -hex 16)"
+          echo "::add-mask::$CI_KEY"
+          docker run -d --name gateway -p 8000:8000 -e GATEWAY_FAKE_PROVIDERS=1 \
+            -e GATEWAY_API_KEYS="ci-smoke:$CI_KEY" llm-gateway:ci
           for i in $(seq 1 30); do curl -sf http://127.0.0.1:8000/health && break; sleep 1; done
-          curl -sf http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/json' \
-            -d '{"model": "auto", "messages": [{"role": "user", "content": "Say hello"}]}'
+          curl -sf http://127.0.0.1:8000/health
+          BODY='{"model": "auto", "messages": [{"role": "user", "content": "Say hello"}]}'
+          # Without credentials the request must be refused.
+          STATUS=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/v1/chat/completions \
+            -H 'Content-Type: application/json' -d "$BODY")
+          if [ "$STATUS" != "401" ]; then echo "expected 401 without credentials, got $STATUS"; exit 1; fi
+          # With the job's key a fake provider answers.
+          RESPONSE=$(curl -sf http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/json' \
+            -H "Authorization: Bearer $CI_KEY" -d "$BODY")
+          echo "$RESPONSE"
+          echo "$RESPONSE" | grep -q '"chat.completion"'
       - name: Smoke-test the dashboard in the same image
         run: |
           docker run -d --name dashboard -p 8501:8501 llm-gateway:ci \
