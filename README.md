@@ -126,7 +126,8 @@ curl http://127.0.0.1:8000/v1/chat/completions \
   -d '{"model": "auto", "messages": [{"role": "user", "content": "Explain step by step why the sky is blue."}]}'
 ```
 
-**Docker** (gateway on :8000, dashboard on :8501, sharing the request log in a volume):
+**Docker** (gateway on :8000, dashboard restricted to the host's loopback interface, sharing the request log in a
+volume):
 
 ```bash
 docker compose up --build
@@ -134,6 +135,17 @@ docker compose up --build
 
 `WITH_EMBEDDINGS=true docker compose up --build` adds sentence-transformers (CPU torch) so the trained router can run
 in the container; without it the gateway uses the rule-based router.
+
+The dashboard is available locally at `http://127.0.0.1:8501`. It displays app IDs, model and release information,
+costs, and error details, and it does not have built-in authentication. Docker Compose therefore publishes it only on
+`127.0.0.1`. For remote administration, keep that binding and use an SSH tunnel:
+
+```bash
+ssh -L 8501:127.0.0.1:8501 user@gateway-host
+```
+
+Then open `http://127.0.0.1:8501` on the administrator's computer. An authenticated reverse proxy is also suitable
+when managed remote access is required.
 
 ## Routing
 

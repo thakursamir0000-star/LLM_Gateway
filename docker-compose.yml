@@ -1,4 +1,4 @@
-# Gateway on :8000, dashboard on :8501, sharing the SQLite request log in a volume.
+# Gateway on :8000, dashboard on localhost:8501, sharing the SQLite request log in a volume.
 #   docker compose up --build
 #   WITH_EMBEDDINGS=true docker compose up --build    # include the classifier router's embedder
 # Keys come from .env (GROQ_API_KEY, OPENROUTER_API_KEY, GEMINI_API_KEY); set GATEWAY_FAKE_PROVIDERS=1 there to run without keys.
@@ -31,7 +31,7 @@ services:
     environment:
       GATEWAY_DB: /app/var/gateway.db
     ports:
-      - "8501:8501"
+      - "127.0.0.1:8501:8501"
     volumes:
       - gateway-data:/app/var
     depends_on:

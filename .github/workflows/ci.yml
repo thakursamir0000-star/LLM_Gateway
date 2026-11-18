@@ -55,7 +55,7 @@ jobs:
           echo "$RESPONSE" | grep -q '"chat.completion"'
       - name: Smoke-test the dashboard in the same image
         run: |
-          docker run -d --name dashboard -p 8501:8501 llm-gateway:ci \
+          docker run -d --name dashboard -p 127.0.0.1:8501:8501 llm-gateway:ci \
             streamlit run dashboard/app.py --server.address=0.0.0.0 --server.port=8501 --server.headless=true
           for i in $(seq 1 30); do curl -sf http://127.0.0.1:8501/_stcore/health && break; sleep 1; done
           curl -sf http://127.0.0.1:8501/_stcore/health

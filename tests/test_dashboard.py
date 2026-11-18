@@ -3,12 +3,30 @@
 from datetime import timedelta
 
 import pytest
+import yaml
 
 from gateway.config import ROOT
 from gateway.monitoring.store import CallRecord, RequestRecord, Store, iso, utc_now
 
 AppTest = pytest.importorskip("streamlit.testing.v1").AppTest
 DASHBOARD = str(ROOT / "dashboard" / "app.py")
+
+
+def test_dashboard_deployment_is_loopback_only_and_keeps_local_healthcheck():
+    compose_path = ROOT / "docker-compose.yml"
+    compose = yaml.safe_load(compose_path.read_text(encoding="utf-8"))
+    dashboard = compose["services"]["dashboard"]
+
+    assert dashboard["ports"] == ["127.0.0.1:8501:8501"]
+    assert "--server.address=0.0.0.0" in dashboard["command"]
+    assert "http://127.0.0.1:8501/_stcore/health" in " ".join(dashboard["healthcheck"]["test"])
+
+    # C2 changes dashboard exposure only. The gateway's existing host mapping remains unchanged.
+    assert compose["services"]["gateway"]["ports"] == ["8000:8000"]
+
+    ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    assert "-p 127.0.0.1:8501:8501" in ci
+    assert "-p 8501:8501" not in ci
 
 
 def populate(path):
