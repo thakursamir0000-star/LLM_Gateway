@@ -514,16 +514,121 @@ config/gateway.yaml configuration
 tests/              pytest suite
 ```
 
+## Production Architecture (Phase 3)
+
+The LLM Gateway supports production-scale multi-instance deployments through SQLAlchemy 2.x Core, PostgreSQL 16, Redis 7, and Alembic migrations.
+
+### 1. SQLite Development Setup
+For local development, SQLite remains supported by default without external dependencies:
+```bash
+python -m venv .venv
+source .venv/bin/activate  # Windows: .venv\Scripts\activate
+pip install -r requirements-dev.txt
+pytest
+python -m gateway
+```
+
+### 2. PostgreSQL Production Setup
+Production deployments require PostgreSQL 16 for persistent storage:
+- Set `GATEWAY_DATABASE_URL=postgresql+psycopg://user:password@host:5432/gateway`.
+- In production (`GATEWAY_ENV=production`), SQLite is rejected by fail-closed startup validation guards.
+- Connection pooling parameters can be configured via `storage.pool_size`, `max_overflow`, `pool_timeout_s`, and `pool_recycle_s`.
+
+### 3. Redis Distributed State Configuration
+Production multi-instance deployments use Redis 7 for:
+- **Distributed Rate Limiting**: Per-model RPM/TPM sliding windows computed atomically using Redis Lua scripts and Redis server time.
+- **Shared Provider Cooldowns**: Model cooldowns following quota exhaustion (429) are synchronized across all gateway instances.
+- **Distributed Circuit Breakers**: Shared `CLOSED`, `OPEN`, and `HALF_OPEN` states with atomic failure counting, recovery deadlines, and lease-expired half-open probes.
+- Configure via `GATEWAY_STATE_BACKEND=redis` and `GATEWAY_REDIS_URL=redis://host:6379/0`.
+- Memory policy must be set to `noeviction`.
+
+### 4. Database Migrations (Alembic)
+Schema evolution is managed using Alembic:
+```bash
+# Apply pending migrations to head
+python -m gateway.migrations upgrade head
+
+# Check current revision
+python -m gateway.migrations current
+
+# Validate database revision matches head
+python -m gateway.migrations check
+
+# Downgrade schema (requires explicit confirmation)
+python -m gateway.migrations downgrade <revision> --confirm-destructive
+```
+
+### 5. SQLite to PostgreSQL Migration
+Migrate existing SQLite databases to PostgreSQL safely:
+```bash
+python scripts/migrate_sqlite_to_postgres.py --sqlite var/gateway.db --postgres-url postgresql+psycopg://user:password@host:5432/gateway
+```
+- Creates an automatic, verified backup of the SQLite database before running.
+- Copies tables in batches with primary and foreign key preservation.
+- Reconciles active budget reservations and skips expired ones.
+- Resets PostgreSQL auto-increment sequences.
+- Generates a reconciliation report with row count and cost validation.
+
+### 6. Docker & Multi-Instance Deployment
+Run the full production stack with two gateway replicas sharing PostgreSQL and Redis:
+```bash
+# Validate Docker Compose configuration
+docker compose config
+
+# Start all services with fake providers for evaluation
+GATEWAY_FAKE_PROVIDERS=1 docker compose up -d
+```
+Services provided:
+- `postgres`: PostgreSQL 16 on `127.0.0.1:5432` with persistent volume `postgres-data`.
+- `redis`: Redis 7 on `127.0.0.1:6379` with `noeviction` policy.
+- `migrations`: One-shot container that upgrades schema to `head` before gateways start.
+- `gateway`: Primary gateway replica on port `8000`.
+- `gateway-replica`: Second gateway replica on port `8001`.
+- `dashboard`: Streamlit dashboard on `127.0.0.1:8501`.
+
+### 7. Health and Readiness Endpoints
+- `GET /health`: Liveness probe. Returns HTTP 200 with service version, routing config, and state backend health (`"ok"` or `"degraded"`).
+- `GET /ready`: Readiness probe. Returns HTTP 200 when PostgreSQL and Redis are both reachable, and HTTP 503 if any required infrastructure is disconnected.
+
+### 8. Outage and Degraded Behavior
+- **Redis Outage**: If Redis fails, gateway detects connection loss, marks state as degraded, and returns HTTP 503 on `/ready`. When configured for development/fallback, in-memory state is used with visible warnings in `/health`.
+- **PostgreSQL Outage**: Budget reservation and persistent request logging fail-closed; unreserved budgeted traffic is refused rather than silently allowed.
+
+### 9. Security Configuration
+- `GATEWAY_API_KEYS="app1:key1,app2:key2"`: Client authentication is fail-closed by default.
+- `GATEWAY_ADMIN_KEY="secret"`: Admin endpoints require `X-Admin-Key` header.
+- `GATEWAY_MAX_BODY_BYTES=10485760`: Request body size limit (default: 10MB).
+- `GATEWAY_CORS_ORIGINS`: Restrictive production CORS origins.
+- `GATEWAY_EXPOSE_METADATA=0`: Sensitive internal gateway diagnostics and headers hidden by default.
+
+## Directory layout
+
+```
+gateway/            the service
+  app.py            FastAPI app and endpoints (/health, /ready, /v1)
+  service.py        the request pipeline
+  config.py         config schema and loading
+  circuit.py        circuit breaker state machine
+  ratelimit.py      token and request pacing
+  state/            shared state backends (in-memory dev, Redis production)
+  providers/        Groq, OpenRouter and Gemini adapters, fake provider, model registry
+  routing/          rules, embeddings, logistic regression, classifier, cascade check
+  monitoring/       SQLAlchemy Core store, metrics, alerts
+  manage/           releases (activate, rollback, canary), budgets, CLI
+migrations/         Alembic versioned migrations
+dashboard/app.py    Streamlit dashboard
+router_lab/         questions and grading, resumable collection, labels, evaluation
+scripts/            prepare_questions, train_router, migrate_sqlite_to_postgres
+config/gateway.yaml configuration
+tests/              pytest suite
+```
+
 ## Limitations and next steps
 
 - The trained classifier is evaluated (see [Results](#results)) but not shipped: `models/router.json` is not
   committed, so `model="router"` requests use the rule-based router. On the held-out questions it saved 8% against
-  always-strong with no significant accuracy difference; the two OpenRouter models' prices are close, so routing can
-  save little there, and it was trained on GSM8K and MMLU prompts only. The rule weights are hand-set, and the
-  cascade check is a heuristic.
+  always-strong with no significant accuracy difference.
 - Streaming has no retry or failover after the first chunk, so a provider failure mid-stream ends the answer early
   (with an SSE error event), and cascade mode does not check streamed answers.
 - Text chat only: tools / function calling, images and `n > 1` are rejected with a clear 400.
-- SQLite fits one gateway instance; several instances would need a shared database (e.g. Postgres) and shared rate
-  limit, cooldown and circuit-breaker state.
 - Costs are list-price estimates from the config, not provider invoices.

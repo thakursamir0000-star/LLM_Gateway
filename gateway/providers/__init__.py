@@ -23,7 +23,7 @@ from typing import Any
 
 import httpx
 
-from gateway.circuit import CircuitBreaker, is_qualifying_failure
+from gateway.circuit import is_qualifying_failure
 from gateway.config import GatewayConfig, ModelSpec
 from gateway.providers.base import (
     OVERLOADED,
@@ -36,7 +36,7 @@ from gateway.providers.base import (
     StreamChunk,
     message_text,
 )
-from gateway.ratelimit import RateLimited, RateLimiter, estimate_tokens
+from gateway.ratelimit import RateLimited, estimate_tokens
 
 __all__ = ["Completion", "ModelRegistry", "Provider", "ProviderError", "StreamChunk", "build_providers",
            "stream_tokens"]
@@ -82,28 +82,35 @@ def build_providers(config: GatewayConfig, *, fake: bool = False) -> dict[str, P
 class ModelRegistry:
     def __init__(self, config: GatewayConfig, providers: dict[str, Provider], *, attempts: int | None = None,
                  max_wait: float | None = None, sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
-                 clock: Callable[[], float] = time.monotonic, pacing: bool = True):
+                 clock: Callable[[], float] = time.monotonic, pacing: bool = True,
+                 state: Any | None = None):
         self.config = config
         self.providers = providers
         self.attempts = attempts if attempts is not None else config.retries.attempts
         self.max_wait = max_wait if max_wait is not None else config.retries.max_wait_s
         self._sleep = sleep
         self._clock = clock
-        self._cooldown_until: dict[str, float] = {}  # alias -> clock time when it may be called again
+        from gateway.state import get_state_backend
+        self.state = state or get_state_backend(config, clock=clock)
         self.circuit_breakers = {
-            name: CircuitBreaker(name, config.circuit_breaker, clock=clock)
+            name: self.state.get_circuit_breaker(name, config.circuit_breaker)
             for name in providers
         }
         # pacing=False (fake providers) ignores the per-minute limits, which only matter for real APIs.
-        self.limiters = {alias: RateLimiter(spec.limits.rpm if pacing else 0, spec.limits.tpm if pacing else 0, clock)
-                         for alias, spec in config.models.items()}
+        self.limiters = {
+            alias: self.state.get_rate_limiter(alias, spec.limits.rpm if pacing else 0, spec.limits.tpm if pacing else 0)
+            for alias, spec in config.models.items()
+        }
 
     def spec(self, alias: str) -> ModelSpec:
         return self.config.models[alias]
 
     def cooldown_left(self, alias: str) -> float:
         """Seconds until ``alias`` may be called again after a quota error (0 = now)."""
-        return max(0.0, self._cooldown_until.get(alias, 0.0) - self._clock())
+        return self.state.cooldown_left(alias)
+
+    def set_cooldown(self, alias: str, cooldown: float) -> None:
+        self.state.set_cooldown(alias, cooldown)
 
     async def complete(self, alias: str, messages: list[dict[str, Any]], params: dict[str, Any]) -> Completion:
         """Call model ``alias``; raises ProviderError after the retries run out."""
@@ -147,7 +154,7 @@ class ModelRegistry:
                     limiter.settle(reservation, 0)
                     if isinstance(e, ProviderError) and e.kind == QUOTA_EXHAUSTED:
                         cooldown = max(self.config.retries.quota_cooldown_s, e.retry_after or 0.0)
-                        self._cooldown_until[alias] = self._clock() + cooldown
+                        self.set_cooldown(alias, cooldown)
                     if not isinstance(e, ProviderError) or e.kind not in RETRYABLE or attempt == self.attempts:
                         settled = True
                         breaker.record_failure(token, is_qualifying=is_qualifying_failure(e))
@@ -218,7 +225,7 @@ class ModelRegistry:
                     except BaseException as e:
                         if isinstance(e, ProviderError) and e.kind == QUOTA_EXHAUSTED:
                             cooldown = max(self.config.retries.quota_cooldown_s, e.retry_after or 0.0)
-                            self._cooldown_until[alias] = self._clock() + cooldown
+                            self.set_cooldown(alias, cooldown)
                         retry_after = e.retry_after if isinstance(e, ProviderError) else None
                         retryable = ((isinstance(e, ProviderError) and e.kind in RETRYABLE)
                                      or isinstance(e, httpx.TransportError))
@@ -248,3 +255,4 @@ class ModelRegistry:
     async def aclose(self) -> None:
         for provider in self.providers.values():
             await provider.aclose()
+        self.state.close()

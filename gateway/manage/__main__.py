@@ -13,7 +13,7 @@ from __future__ import annotations
 import argparse
 import sys
 
-from gateway.config import load_config, resolve_path
+from gateway.config import database_target, load_config
 from gateway.manage.releases import ReleaseError, ReleaseManager
 from gateway.monitoring.store import Store
 
@@ -57,7 +57,13 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     config = load_config(args.config)
-    store = Store(resolve_path(config.storage.db_path))
+    store = Store(
+        database_target(config),
+        pool_size=config.storage.pool_size,
+        max_overflow=config.storage.max_overflow,
+        pool_timeout_s=config.storage.pool_timeout_s,
+        pool_recycle_s=config.storage.pool_recycle_s,
+    )
     manager = ReleaseManager(config, store)
     try:
         if args.command == "activate":

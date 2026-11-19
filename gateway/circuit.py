@@ -35,6 +35,7 @@ class ProbeToken:
     allowed: bool
     is_probe: bool = False
     provider: str = ""
+    token_id: str = ""
 
 
 def is_qualifying_failure(exc: BaseException) -> bool:

@@ -200,3 +200,15 @@ security:
 
 storage:
   db_path: var/gateway.db
+  pool_size: 5
+  max_overflow: 10
+  pool_timeout_s: 30
+  pool_recycle_s: 1800
+
+state:
+  backend: memory
+  redis:
+    url: redis://localhost:6379/0
+    socket_timeout_s: 2.0
+    connect_timeout_s: 2.0
+    max_connections: 50

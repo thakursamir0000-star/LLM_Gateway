@@ -232,7 +232,7 @@ class Gateway:
             self._fail(record, error, detail=f"{type(e).__name__}: {e}")
             raise error from e
         finally:
-            self._finish(record, started)  # also settles the request's budget reservation
+            await self._finish(record, started)  # also settles the request's budget reservation
 
     async def stream(
         self, request: ChatRequest, ctx: RequestContext, expose_metadata: bool = True
@@ -252,25 +252,25 @@ class Gateway:
         except GatewayError as e:
             if record.http_status is None:  # not recorded yet by the provider-failure paths
                 self._fail(record, e)
-            self._finish(record, started)
+            await self._finish(record, started)
             raise
         except ProviderError as e:
             error = from_provider_error(e)
             self._fail(record, error, detail=upstream_detail(record.id, e))
-            self._finish(record, started)
+            await self._finish(record, started)
             raise error from e
         except asyncio.CancelledError:
             record.status, record.error_type = "error", "cancelled"
             record.error_message = "client disconnected or request cancelled before the first chunk"
             if record.calls and record.calls[-1].status == "ok" and record.calls[-1].latency_ms is None:
                 record.calls[-1].status, record.calls[-1].error_type = "error", "cancelled"
-            self._finish(record, started)
+            await self._finish(record, started)
             raise
         except Exception as e:
             log.exception("streaming request %s failed", ctx.request_id)
             error = GatewayError(500, "internal gateway error", type_="server_error", code="internal_error")
             self._fail(record, error, detail=f"{type(e).__name__}: {e}")
-            self._finish(record, started)
+            await self._finish(record, started)
             raise error from e
 
     async def _open_stream(self, request: ChatRequest, ctx: RequestContext, record: RequestRecord, now: datetime,
@@ -286,14 +286,16 @@ class Gateway:
         mode, pinned = self.resolve_mode(request.model)
         notes: list[str] = []
 
-        budget = self.budgets.status(ctx.app_id, self.store.app_spend(ctx.app_id, record.day))
+        spent = await asyncio.to_thread(self.store.app_spend, ctx.app_id, record.day)
+        budget = self.budgets.status(ctx.app_id, spent)
         if budget.exceeded:
             raise self._budget_error(ctx.app_id, budget.spent, budget.limit, now)
         if budget.soft and mode in ("router", "cascade", "strong"):
             notes.append(f"over {self.budgets.config.soft_limit_fraction:.0%} of the daily budget: cheap model")
             mode = "cheap"
 
-        release_name, canary = self.releases.pick(self.releases.state(), request.user, self.rng)
+        state = await asyncio.to_thread(self.releases.state)
+        release_name, canary = self.releases.pick(state, request.user, self.rng)
         release = self.config.releases[release_name]
         record.release, record.canary, record.prompt_version = release_name, canary, release.prompt
         system_prompt = self.config.prompts[release.prompt]
@@ -330,7 +332,7 @@ class Gateway:
 
         allow_fallback = not pinned and (self.config.routing.fallback_on_error or mode == "cascade")
         chain = self.fallback_chain(tier, alias, release, latency) if allow_fallback else [(tier, alias)]
-        self._reserve_budget(record, ctx.app_id, now, [a for _, a in chain], messages, params)
+        await self._reserve_budget(record, ctx.app_id, now, [a for _, a in chain], messages, params)
 
         active_gen = None
         active_tier = None
@@ -549,7 +551,7 @@ class Gateway:
                 yield f"data: {json.dumps(safe_err)}\n\n"
                 yield "data: [DONE]\n\n"
             finally:
-                self._finish(record, started)
+                await self._finish(record, started)
                 await active_gen.aclose()
 
         return event_generator(), headers
@@ -566,14 +568,16 @@ class Gateway:
         mode, pinned = self.resolve_mode(request.model)
         notes: list[str] = []
 
-        budget = self.budgets.status(ctx.app_id, self.store.app_spend(ctx.app_id, record.day))
+        spent = await asyncio.to_thread(self.store.app_spend, ctx.app_id, record.day)
+        budget = self.budgets.status(ctx.app_id, spent)
         if budget.exceeded:
             raise self._budget_error(ctx.app_id, budget.spent, budget.limit, now)
         if budget.soft and mode in ("router", "cascade", "strong"):
             notes.append(f"over {self.budgets.config.soft_limit_fraction:.0%} of the daily budget: cheap model")
             mode = "cheap"
 
-        release_name, canary = self.releases.pick(self.releases.state(), request.user, self.rng)
+        state = await asyncio.to_thread(self.releases.state)
+        release_name, canary = self.releases.pick(state, request.user, self.rng)
         release = self.config.releases[release_name]
         record.release, record.canary, record.prompt_version = release_name, canary, release.prompt
         system_prompt = self.config.prompts[release.prompt]
@@ -611,7 +615,9 @@ class Gateway:
         allow_fallback = not pinned and (self.config.routing.fallback_on_error or mode == "cascade")
         chain = self.fallback_chain(tier, alias, release, latency) if allow_fallback else [(tier, alias)]
         escalation = release.model_for("strong", latency) if mode == "cascade" and not pinned else None
-        self._reserve_budget(record, ctx.app_id, now, [a for _, a in chain], messages, params, then=escalation)
+        await self._reserve_budget(
+            record, ctx.app_id, now, [a for _, a in chain], messages, params, then=escalation
+        )
         completion, tier, alias = await self._call_with_fallback(record, tier, alias, release, latency, messages,
                                                                  params, allow_fallback)
         if record.fallback:
@@ -709,8 +715,9 @@ class Gateway:
             type_="budget_exceeded", code="budget_exceeded", retry_after=seconds_until_utc_midnight(now),
             counts_as_error=False)
 
-    def _reserve_budget(self, record: RequestRecord, app_id: str, now: datetime, aliases: list[str],
-                        messages: list[dict[str, Any]], params: dict[str, Any], then: str | None = None) -> None:
+    async def _reserve_budget(self, record: RequestRecord, app_id: str, now: datetime, aliases: list[str],
+                              messages: list[dict[str, Any]], params: dict[str, Any],
+                              then: str | None = None) -> None:
         """Reserve the request's estimated maximum cost before any provider call (see manage/budgets.py).
 
         ``aliases`` are the models the request may try in turn (one of them answers); ``then`` is a model
@@ -725,24 +732,32 @@ class Gateway:
         if then is not None:
             estimate += reservation_estimate([self.config.models[then]], messages, params, output_tokens)
         expires = now + timedelta(seconds=self.budgets.config.reservation_ttl_s)
-        held = self.store.reserve_budget(record.id, app_id, record.day, limit, estimate, iso(self.clock()),
-                                         iso(expires))
+        held = await asyncio.to_thread(
+            self.store.reserve_budget,
+            record.id,
+            app_id,
+            record.day,
+            limit,
+            estimate,
+            iso(self.clock()),
+            iso(expires),
+        )
         if not held.admitted:
             raise self._budget_error(app_id, held.spent, limit, now, reserved=held.reserved)
 
-    def _finish(self, record: RequestRecord, started: float) -> None:
+    async def _finish(self, record: RequestRecord, started: float) -> None:
         """Log a finished request (once) and check alerts. Neither may break the response: a storage or
         alert failure goes to the gateway's log, with what the lost row would have said."""
         record.latency_ms = round((time.perf_counter() - started) * 1000, 2)
         self._totals(record)
         try:
-            self.store.log_request(record)
+            await asyncio.to_thread(self.store.log_request, record)
         except Exception:
             log.exception("could not log request %s (status %s, http %s, error %s, cost $%.8f)", record.id,
                           record.status, record.http_status, record.error_type, record.cost_usd)
         if self.alerts is not None:
             try:
-                self.alerts.maybe_check()
+                await asyncio.to_thread(self.alerts.maybe_check)
             except Exception:
                 log.exception("alert check failed")
 

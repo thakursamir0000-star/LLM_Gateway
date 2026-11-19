@@ -12,55 +12,99 @@ jobs:
       fail-fast: false
       matrix:
         python: ["3.11", "3.12"]
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: gateway_test
+          POSTGRES_USER: gateway
+          POSTGRES_PASSWORD: gateway_test_password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python }}
           cache: pip
-      - name: Install
+      - name: Install dependencies
         run: pip install -r requirements-dev.txt
       - name: Lint
         run: ruff check .
-      - name: Test (fake providers and mocked HTTP; no API keys, no LLM calls)
+      - name: Test (unit, SQLite, PostgreSQL, Redis distributed state, and migrations)
+        env:
+          GATEWAY_DATABASE_URL: postgresql+psycopg://gateway:gateway_test_password@localhost:5432/gateway_test
+          GATEWAY_REDIS_URL: redis://localhost:6379/0
         run: pytest
 
   docker:
-    name: docker build and smoke test
+    name: docker build and multi-instance smoke test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - name: Validate the compose file
         run: docker compose config --quiet
       - name: Build the image
-        run: docker build -t llm-gateway:ci .
-      - name: Smoke-test the gateway with fake providers
+        run: docker build -t llm-gateway:local .
+      - name: Run multi-instance compose stack with fake providers
         run: |
-          # Auth is fail-closed, so the job makes a throwaway bearer key for itself. Fake providers make no API calls.
           CI_KEY="ci-$(openssl rand -hex 16)"
           echo "::add-mask::$CI_KEY"
-          docker run -d --name gateway -p 8000:8000 -e GATEWAY_FAKE_PROVIDERS=1 \
-            -e GATEWAY_API_KEYS="ci-smoke:$CI_KEY" llm-gateway:ci
-          for i in $(seq 1 30); do curl -sf http://127.0.0.1:8000/health && break; sleep 1; done
+          echo "GATEWAY_FAKE_PROVIDERS=1" >> .env
+          echo "GATEWAY_API_KEYS=ci-smoke:$CI_KEY" >> .env
+          echo "GATEWAY_ADMIN_KEY=ci-admin-key" >> .env
+
+          docker compose up -d postgres redis migrations
+          # Wait for migrations to complete
+          docker compose wait migrations
+          # Loopback-only dashboard exposure: -p 127.0.0.1:8501:8501
+          docker compose up -d gateway gateway-replica dashboard
+
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:8000/health && curl -sf http://127.0.0.1:8001/health && break
+            sleep 1
+          done
+
+          # Health and readiness on both replicas
           curl -sf http://127.0.0.1:8000/health
+          curl -sf http://127.0.0.1:8001/health
+          curl -sf http://127.0.0.1:8000/ready
+          curl -sf http://127.0.0.1:8001/ready
+
           BODY='{"model": "auto", "messages": [{"role": "user", "content": "Say hello"}]}'
-          # Without credentials the request must be refused.
+          # Unauthenticated returns 401
           STATUS=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/v1/chat/completions \
             -H 'Content-Type: application/json' -d "$BODY")
           if [ "$STATUS" != "401" ]; then echo "expected 401 without credentials, got $STATUS"; exit 1; fi
-          # With the job's key a fake provider answers.
-          RESPONSE=$(curl -sf http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/json' \
+
+          # Authenticated chat works on replica 1
+          RESP1=$(curl -sf http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/json' \
             -H "Authorization: Bearer $CI_KEY" -d "$BODY")
-          echo "$RESPONSE"
-          echo "$RESPONSE" | grep -q '"chat.completion"'
-      - name: Smoke-test the dashboard in the same image
-        run: |
-          docker run -d --name dashboard -p 127.0.0.1:8501:8501 llm-gateway:ci \
-            streamlit run dashboard/app.py --server.address=0.0.0.0 --server.port=8501 --server.headless=true
+          echo "$RESP1" | grep -q '"chat.completion"'
+
+          # Authenticated chat works on replica 2
+          RESP2=$(curl -sf http://127.0.0.1:8001/v1/chat/completions -H 'Content-Type: application/json' \
+            -H "Authorization: Bearer $CI_KEY" -d "$BODY")
+          echo "$RESP2" | grep -q '"chat.completion"'
+
+          # Dashboard health check
           for i in $(seq 1 30); do curl -sf http://127.0.0.1:8501/_stcore/health && break; sleep 1; done
           curl -sf http://127.0.0.1:8501/_stcore/health
+
       - name: Container logs
         if: always()
-        run: |
-          docker logs gateway || true
-          docker logs dashboard || true
+        run: docker compose logs
