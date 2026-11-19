@@ -13,7 +13,9 @@ from __future__ import annotations
 import hashlib
 import logging
 import random
+from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 
 from gateway.config import GatewayConfig
 from gateway.monitoring.store import Store, iso, utc_now
@@ -52,8 +54,7 @@ class ReleaseManager:
     def _valid(self, state: DeploymentState) -> bool:
         return state.active in self.config.releases and (state.canary is None or state.canary in self.config.releases)
 
-    def state(self) -> DeploymentState:
-        rows = self.store.deployments(limit=1)
+    def _state_from_rows(self, rows: list[dict[str, Any]]) -> DeploymentState:
         if not rows:
             return self._initial()
         row = rows[0]
@@ -63,12 +64,33 @@ class ReleaseManager:
             return self._initial()
         return state
 
+    def state(self) -> DeploymentState:
+        return self._state_from_rows(self.store.deployments(limit=1))
+
     def history(self, limit: int = 20) -> list[dict]:
         return self.store.deployments(limit)
 
-    def _record(self, action: str, state: DeploymentState, note: str) -> DeploymentState:
+    def _change(self, action: str,
+                transition: Callable[[DeploymentState, list[dict[str, Any]]], DeploymentState],
+                note: str) -> DeploymentState:
         ts = iso(utc_now())
-        self.store.add_deployment(action, state.active, state.canary, state.canary_share, note, ts)
+        selected: DeploymentState | None = None
+
+        def mutate(rows: list[dict[str, Any]]) -> dict[str, Any]:
+            nonlocal selected
+            selected = transition(self._state_from_rows(rows[:1]), rows)
+            return {
+                "ts": ts,
+                "action": action,
+                "active": selected.active,
+                "canary_release": selected.canary,
+                "canary_share": selected.canary_share,
+                "note": note,
+            }
+
+        self.store.mutate_deployment(mutate)
+        assert selected is not None
+        state = selected
         log.info("deployment %s: active=%s canary=%s share=%.2f", action, state.active, state.canary,
                  state.canary_share)
         return DeploymentState(state.active, state.canary, state.canary_share, "log", ts)
@@ -80,41 +102,46 @@ class ReleaseManager:
     def activate(self, release: str, note: str = "") -> DeploymentState:
         """Make ``release`` the active one. Promoting the canary ends the canary."""
         self._check_release(release)
-        current = self.state()
-        if release == current.active:
-            raise ReleaseError(f"{release!r} is already active")
-        keep_canary = current.canary if current.canary != release else None
-        return self._record("activate", DeploymentState(release, keep_canary,
-                                                        current.canary_share if keep_canary else 0.0), note)
+
+        def transition(current: DeploymentState, _rows: list[dict[str, Any]]) -> DeploymentState:
+            if release == current.active:
+                raise ReleaseError(f"{release!r} is already active")
+            keep_canary = current.canary if current.canary != release else None
+            return DeploymentState(release, keep_canary, current.canary_share if keep_canary else 0.0)
+
+        return self._change("activate", transition, note)
 
     def rollback(self, note: str = "") -> DeploymentState:
         """Re-activate the release that was active before the current one; stops any canary."""
-        current = self.state()
-        previous = None
-        for row in self.store.deployments(limit=1000)[1:]:
-            if row["active"] != current.active and row["active"] in self.config.releases:
-                previous = row["active"]
-                break
-        if previous is None and self._initial().active != current.active:
-            previous = self._initial().active
-        if previous is None:
-            raise ReleaseError("nothing to roll back to: no earlier active release")
-        return self._record("rollback", DeploymentState(previous), note)
+        def transition(current: DeploymentState, rows: list[dict[str, Any]]) -> DeploymentState:
+            previous = next((row["active"] for row in rows[1:]
+                             if row["active"] != current.active and row["active"] in self.config.releases), None)
+            if previous is None and self._initial().active != current.active:
+                previous = self._initial().active
+            if previous is None:
+                raise ReleaseError("nothing to roll back to: no earlier active release")
+            return DeploymentState(previous)
+
+        return self._change("rollback", transition, note)
 
     def set_canary(self, release: str, share: float, note: str = "") -> DeploymentState:
         self._check_release(release)
         if not 0.0 <= share <= 1.0:
             raise ReleaseError("canary share must be between 0 and 1")
-        current = self.state()
-        if release == current.active:
-            raise ReleaseError(f"{release!r} is the active release; a canary must be a different release")
-        return self._record("canary", DeploymentState(current.active, release, share), note)
+        def transition(current: DeploymentState, _rows: list[dict[str, Any]]) -> DeploymentState:
+            if release == current.active:
+                raise ReleaseError(f"{release!r} is the active release; a canary must be a different release")
+            return DeploymentState(current.active, release, share)
+
+        return self._change("canary", transition, note)
 
     def clear_canary(self, note: str = "") -> DeploymentState:
-        current = self.state()
-        if current.canary is None:
-            raise ReleaseError("no canary is running")
-        return self._record("canary-off", DeploymentState(current.active), note)
+        def transition(current: DeploymentState, _rows: list[dict[str, Any]]) -> DeploymentState:
+            if current.canary is None:
+                raise ReleaseError("no canary is running")
+            return DeploymentState(current.active)
+
+        return self._change("canary-off", transition, note)
 
     @staticmethod
     def pick(state: DeploymentState, sticky_key: str | None, rng: random.Random) -> tuple[str, bool]:

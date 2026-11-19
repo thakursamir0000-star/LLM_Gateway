@@ -7,6 +7,7 @@ gateway by changing its base URL to ``http://<host>:8000/v1``.
 
 from __future__ import annotations
 
+import asyncio
 import hmac
 import math
 import os
@@ -15,6 +16,7 @@ import re
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, Request
@@ -23,7 +25,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from gateway import __version__
-from gateway.config import LATENCY_CLASSES, ROOT, GatewayConfig, load_config, resolve_path
+from gateway.config import LATENCY_CLASSES, ROOT, GatewayConfig, database_target, load_config
 from gateway.manage.budgets import BudgetPolicy
 from gateway.manage.releases import ReleaseError, ReleaseManager
 from gateway.monitoring import metrics
@@ -51,21 +53,55 @@ def _truthy(value: str | None) -> bool:
     return (value or "").strip().lower() in ("1", "true", "yes", "on")
 
 
+def _enforce_production_guards(config: GatewayConfig) -> None:
+    db_target = database_target(config)
+    if isinstance(db_target, Path) or str(db_target).startswith("sqlite"):
+        raise RuntimeError("Production requires PostgreSQL database (GATEWAY_DATABASE_URL), SQLite is forbidden.")
+    if config.auth.allow_anonymous:
+        raise RuntimeError("Production cannot permit anonymous access (GATEWAY_ALLOW_ANONYMOUS=0 required).")
+    keys_raw = os.environ.get(config.auth.keys_env, "").strip()
+    if not keys_raw:
+        raise RuntimeError(f"Production requires client API keys configured via {config.auth.keys_env}.")
+    admin_key = os.environ.get(config.auth.admin_key_env, "").strip()
+    if not admin_key:
+        raise RuntimeError(f"Production requires admin key configured via {config.auth.admin_key_env}.")
+    if config.state.backend != "redis":
+        raise RuntimeError("Production requires Redis state backend (GATEWAY_STATE_BACKEND=redis).")
+
+
 def create_app(config: GatewayConfig | None = None, *, providers: dict[str, Provider] | None = None,
                router: Router | None = None, store: Store | None = None, rng: random.Random | None = None,
                clock: Callable[[], datetime] = utc_now, notify: Callable[[Alert], None] | None = None,
-               sleep: Callable[[float], Any] | None = None) -> FastAPI:
+               sleep: Callable[[float], Any] | None = None,
+               state: Any | None = None) -> FastAPI:
     """Build the app. Every dependency can be injected (tests pass fakes)."""
     if config is None:
         from dotenv import load_dotenv
 
         load_dotenv(ROOT / ".env")  # does not override variables that are already set
         config = load_config()
+
+    is_production = os.environ.get("GATEWAY_ENV", "").strip().lower() == "production"
+    if is_production:
+        _enforce_production_guards(config)
+
     fake = providers is None and _truthy(os.environ.get("GATEWAY_FAKE_PROVIDERS"))
     providers = providers if providers is not None else build_providers(config, fake=fake)
-    registry = ModelRegistry(config, providers, pacing=not fake, **({"sleep": sleep} if sleep else {}))
+    registry = ModelRegistry(
+        config,
+        providers,
+        pacing=not fake,
+        state=state,
+        **({"sleep": sleep} if sleep else {}),
+    )
     owns_store = store is None
-    store = store if store is not None else Store(resolve_path(config.storage.db_path))
+    store = store if store is not None else Store(
+        database_target(config),
+        pool_size=config.storage.pool_size,
+        max_overflow=config.storage.max_overflow,
+        pool_timeout_s=config.storage.pool_timeout_s,
+        pool_recycle_s=config.storage.pool_recycle_s,
+    )
     router = router if router is not None else build_router(config)
     webhook = os.environ.get(config.alerts.webhook_env)
     notify = notify or (webhook_notifier(webhook) if webhook else log_notifier)
@@ -225,36 +261,71 @@ def create_app(config: GatewayConfig | None = None, *, providers: dict[str, Prov
     @app.post("/v1/feedback")
     async def feedback(body: FeedbackRequest, request: Request) -> dict[str, Any]:
         app_id = app_id_for(request)
-        owner = store.request_app(body.request_id)
+        owner = await asyncio.to_thread(store.request_app, body.request_id)
         if owner is None or (api_keys and owner != app_id):
             raise GatewayError(404, f"no request {body.request_id!r}", param="request_id", code="request_not_found")
-        feedback_id = store.add_feedback(body.request_id, app_id, body.value, body.comment, iso(clock()))
+        feedback_id = await asyncio.to_thread(
+            store.add_feedback, body.request_id, app_id, body.value, body.comment, iso(clock())
+        )
         return {"ok": True, "feedback_id": feedback_id, "request_id": body.request_id, "score": body.value}
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
-        state = releases.state()
-        return {"status": "ok", "version": __version__, "release": state.active, "canary": state.canary,
-                "canary_share": state.canary_share, "default_mode": config.routing.default_mode,
-                "threshold": config.routing.threshold,
-                "classifier_threshold": config.routing.classifier_threshold,
-                "latency_default": config.latency.default,
-                "router": router.description, "fake_providers": fake,
-                "auth": "api_keys" if api_keys else ("x-app-id" if config.auth.allow_anonymous else "fail_closed")}
+        state = await asyncio.to_thread(releases.state)
+        state_status = registry.state.status() if hasattr(registry, "state") else {"backend": "memory", "ready": True}
+        is_healthy = state_status.get("ready", True) and not state_status.get("degraded", False)
+        return {
+            "status": "ok" if is_healthy else "degraded",
+            "version": __version__,
+            "release": state.active,
+            "canary": state.canary,
+            "canary_share": state.canary_share,
+            "default_mode": config.routing.default_mode,
+            "threshold": config.routing.threshold,
+            "classifier_threshold": config.routing.classifier_threshold,
+            "latency_default": config.latency.default,
+            "router": router.description,
+            "fake_providers": fake,
+            "auth": "api_keys" if api_keys else ("x-app-id" if config.auth.allow_anonymous else "fail_closed"),
+            "state": state_status,
+        }
+
+    @app.get("/ready")
+    async def ready():
+        # Check database connectivity
+        db_ok, db_reason = True, "ok"
+        try:
+            await asyncio.to_thread(store.scalar, "SELECT 1")
+        except Exception as e:
+            db_ok, db_reason = False, str(e)
+
+        # Check state backend (Redis)
+        state_ok, state_reason = True, "ok"
+        if hasattr(registry, "state"):
+            state_ok, state_reason = registry.state.is_ready()
+
+        is_ready = db_ok and state_ok
+        status_code = 200 if is_ready else 503
+        data = {
+            "status": "ready" if is_ready else "not_ready",
+            "database": {"ok": db_ok, "detail": db_reason},
+            "state_backend": registry.state.status() if hasattr(registry, "state") else {"backend": "memory", "ready": True},
+        }
+        return JSONResponse(data, status_code=status_code)
 
     # ── admin ───────────────────────────────────────────────────────
-    def deployment_view() -> dict[str, Any]:
-        state = releases.state()
+    async def deployment_view() -> dict[str, Any]:
+        state = await asyncio.to_thread(releases.state)
         return {"active": state.active, "canary": state.canary, "canary_share": state.canary_share,
                 "source": state.source, "since": state.ts,
                 "releases": {name: r.model_dump() for name, r in config.releases.items()}}
 
-    def change(action: Callable[[], Any]) -> dict[str, Any]:
+    async def change(action: Callable[[], Any]) -> dict[str, Any]:
         try:
-            action()
+            await asyncio.to_thread(action)
         except ReleaseError as e:
             raise GatewayError(400, str(e), code="invalid_release_change") from e
-        return deployment_view()
+        return await deployment_view()
 
     @app.get("/admin/status")
     async def admin_status(request: Request) -> dict[str, Any]:
@@ -262,39 +333,43 @@ def create_app(config: GatewayConfig | None = None, *, providers: dict[str, Prov
         now = clock()
         day = iso(now)[:10]
         budgets = gateway.budgets
-        spend = [{**row, "daily_limit_usd": budgets.limit(row["app_id"])} for row in metrics.app_spend(store, day)]
-        return {"deployment": deployment_view(), "router": router.description,
-                "last_24h": metrics.summary(store, since=iso(now - timedelta(hours=24))),
-                "spend_today": spend, "alerts": store.alerts(10)}
+        spend_rows, summary, alerts = await asyncio.gather(
+            asyncio.to_thread(metrics.app_spend, store, day),
+            asyncio.to_thread(metrics.summary, store, iso(now - timedelta(hours=24))),
+            asyncio.to_thread(store.alerts, 10),
+        )
+        spend = [{**row, "daily_limit_usd": budgets.limit(row["app_id"])} for row in spend_rows]
+        return {"deployment": await deployment_view(), "router": router.description,
+                "last_24h": summary, "spend_today": spend, "alerts": alerts}
 
     @app.post("/admin/activate")
     async def admin_activate(body: ActivateRequest, request: Request) -> dict[str, Any]:
         require_admin(request)
-        return change(lambda: releases.activate(body.release, body.note))
+        return await change(lambda: releases.activate(body.release, body.note))
 
     @app.post("/admin/rollback")
     async def admin_rollback(request: Request, body: NoteRequest | None = None) -> dict[str, Any]:
         require_admin(request)
-        return change(lambda: releases.rollback(body.note if body else ""))
+        return await change(lambda: releases.rollback(body.note if body else ""))
 
     @app.post("/admin/canary")
     async def admin_canary(body: CanaryRequest, request: Request) -> dict[str, Any]:
         require_admin(request)
-        return change(lambda: releases.set_canary(body.release, body.share, body.note))
+        return await change(lambda: releases.set_canary(body.release, body.share, body.note))
 
     @app.delete("/admin/canary")
     async def admin_canary_off(request: Request) -> dict[str, Any]:
         require_admin(request)
-        return change(lambda: releases.clear_canary())
+        return await change(lambda: releases.clear_canary())
 
     @app.get("/admin/deployments")
     async def admin_deployments(request: Request, limit: int = 50) -> dict[str, Any]:
         require_admin(request)
-        return {"deployments": releases.history(limit)}
+        return {"deployments": await asyncio.to_thread(releases.history, limit)}
 
     @app.get("/admin/alerts")
     async def admin_alerts(request: Request, limit: int = 50) -> dict[str, Any]:
         require_admin(request)
-        return {"alerts": store.alerts(limit)}
+        return {"alerts": await asyncio.to_thread(store.alerts, limit)}
 
     return app

@@ -1,0 +1,8 @@
+Alembic migrations for the LLM Gateway.
+
+Run migrations as a separate one-shot operation:
+
+    python -m gateway.migrations upgrade --adopt-existing
+
+The adoption flag is required only for a pre-Alembic database. The schema is
+validated before it is stamped. Application replicas never run migrations.

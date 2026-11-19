@@ -29,6 +29,8 @@ class RateLimited(Exception):
 class Reservation:
     t: float
     tokens: int
+    model: str = ""
+    reservation_id: str = ""
 
 
 class RateLimiter:

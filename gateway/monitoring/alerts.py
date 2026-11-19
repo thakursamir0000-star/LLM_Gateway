@@ -15,8 +15,10 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 
+from sqlalchemy import case, func, select
+
 from gateway.config import AlertConfig
-from gateway.monitoring.store import Store, iso, utc_now
+from gateway.monitoring.store import REQUESTS, Store, iso, utc_now
 
 log = logging.getLogger("gateway.alerts")
 
@@ -33,8 +35,10 @@ def evaluate(store: Store, config: AlertConfig, now: datetime) -> list[Alert]:
     """Alerts that are over their limit right now (whether or not already sent)."""
     alerts = []
     since = iso(now - timedelta(minutes=config.window_minutes))
-    row = store.query("SELECT COUNT(*) AS n, COALESCE(SUM(status = 'error'), 0) AS errors FROM requests "
-                      "WHERE ts >= ? AND status != 'rejected'", (since,))[0]
+    row = store.query(select(
+        func.count().label("n"),
+        func.coalesce(func.sum(case((REQUESTS.c.status == "error", 1), else_=0)), 0).label("errors"),
+    ).where(REQUESTS.c.ts >= since, REQUESTS.c.status != "rejected"))[0]
     if row["n"] >= config.min_requests:
         rate = row["errors"] / row["n"]
         if rate > config.error_rate:
@@ -89,21 +93,23 @@ class AlertMonitor:
             self._last_check = now
         return self.check(now)
 
-    def _is_new(self, alert: Alert, now: datetime) -> bool:
+    def _dedup_key(self, alert: Alert, now: datetime) -> str | None:
         last = self.store.last_alert(alert.kind)
-        if last is None:
-            return True
         if alert.kind == "daily_cost":
-            return last["ts"][:10] != iso(now)[:10]
-        return last["ts"] < iso(now - timedelta(minutes=self.config.window_minutes))
+            day = iso(now)[:10]
+            return f"daily_cost:{day}" if last is None or last["ts"][:10] != day else None
+        if last is not None and last["ts"] >= iso(now - timedelta(minutes=self.config.window_minutes)):
+            return None
+        return f"error_rate:after:{last['id'] if last is not None else 'initial'}"
 
     def check(self, now: datetime | None = None) -> list[Alert]:
         """Evaluate, then store and send the alerts that haven't been sent recently."""
         now = now or self.clock()
         fired = []
         for alert in evaluate(self.store, self.config, now):
-            if self._is_new(alert, now):
-                self.store.add_alert(alert.kind, alert.value, alert.threshold, alert.message, iso(now))
+            dedup_key = self._dedup_key(alert, now)
+            if dedup_key and self.store.add_alert(
+                    alert.kind, alert.value, alert.threshold, alert.message, iso(now), dedup_key):
                 self.notify(alert)
                 fired.append(alert)
         return fired

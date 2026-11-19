@@ -20,7 +20,7 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 
-from gateway.config import load_config, resolve_path
+from gateway.config import database_target, load_config, resolve_path
 from gateway.manage.budgets import BudgetPolicy
 from gateway.manage.releases import ReleaseManager
 from gateway.monitoring import metrics
@@ -35,7 +35,7 @@ RANGES = {"Last 24 hours": timedelta(hours=24), "Last 7 days": timedelta(days=7)
 
 st.set_page_config(page_title="LLM Gateway", layout="wide")
 config = load_config()
-db_path = resolve_path(config.storage.db_path)
+db_path = database_target(config)
 
 
 @st.cache_resource
@@ -44,10 +44,12 @@ def open_store(path: str) -> Store:
 
 
 st.title("LLM Gateway")
-if not Path(db_path).exists():
+target_str = str(db_path)
+is_sqlite = "://" not in target_str or target_str.startswith("sqlite")
+if is_sqlite and not Path(db_path).exists():
     st.info(f"No request log yet at `{db_path}`. Send a request to the gateway, then refresh.")
     st.stop()
-store = open_store(str(db_path))
+store = open_store(target_str)
 
 with st.sidebar:
     range_name = st.selectbox("Time range", list(RANGES), index=1)

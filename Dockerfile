@@ -28,6 +28,9 @@ COPY gateway ./gateway
 COPY dashboard ./dashboard
 COPY config ./config
 COPY models ./models
+COPY scripts ./scripts
+COPY migrations ./migrations
+COPY alembic.ini ./alembic.ini
 
 RUN useradd --create-home --uid 1000 app && mkdir -p /app/var && chown app /app/var
 USER app

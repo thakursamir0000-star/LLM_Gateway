@@ -3,6 +3,7 @@
 Environment overrides:
 - ``GATEWAY_CONFIG``: path of the YAML file (default ``config/gateway.yaml``);
 - ``GATEWAY_DB``: path of the SQLite request log (``storage.db_path``).
+- ``GATEWAY_DATABASE_URL``: SQLAlchemy database URL (required in production).
 
 Relative paths in the file are resolved against the project root, so the
 gateway, the dashboard and the scripts find the same files from any directory.
@@ -167,6 +168,22 @@ class SecurityConfig(_Strict):
 
 class StorageConfig(_Strict):
     db_path: str = "var/gateway.db"
+    pool_size: int = Field(5, ge=1)
+    max_overflow: int = Field(10, ge=0)
+    pool_timeout_s: float = Field(30, gt=0)
+    pool_recycle_s: int = Field(1800, ge=0)
+
+
+class RedisConfig(_Strict):
+    url: str = "redis://localhost:6379/0"
+    socket_timeout_s: float = Field(2.0, gt=0)
+    connect_timeout_s: float = Field(2.0, gt=0)
+    max_connections: int = Field(50, ge=1)
+
+
+class StateConfig(_Strict):
+    backend: Literal["memory", "redis"] = "memory"
+    redis: RedisConfig = Field(default_factory=RedisConfig)
 
 
 class GatewayConfig(_Strict):
@@ -184,6 +201,7 @@ class GatewayConfig(_Strict):
     auth: AuthConfig = Field(default_factory=AuthConfig)
     security: SecurityConfig = Field(default_factory=SecurityConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)
+    state: StateConfig = Field(default_factory=StateConfig)
 
     @model_validator(mode="after")
     def _check_references(self) -> GatewayConfig:
@@ -225,6 +243,11 @@ def resolve_path(path: str | Path) -> Path:
     return path if path.is_absolute() else ROOT / path
 
 
+def database_target(config: GatewayConfig) -> str | Path:
+    """Configured SQLAlchemy URL, or the development SQLite path."""
+    return os.environ.get("GATEWAY_DATABASE_URL") or resolve_path(config.storage.db_path)
+
+
 def load_config(path: str | Path | None = None) -> GatewayConfig:
     """Read and validate the config (``path``, else $GATEWAY_CONFIG, else the default)."""
     path = Path(path or os.environ.get("GATEWAY_CONFIG") or DEFAULT_CONFIG)
@@ -248,4 +271,12 @@ def load_config(path: str | Path | None = None) -> GatewayConfig:
     expose_meta = os.environ.get("GATEWAY_EXPOSE_METADATA")
     if expose_meta is not None:
         config.security.expose_internal_metadata = expose_meta.strip().lower() in ("1", "true", "yes", "on")
+    state_backend = os.environ.get("GATEWAY_STATE_BACKEND")
+    if state_backend:
+        backend_val = state_backend.strip().lower()
+        if backend_val in ("memory", "redis"):
+            config.state.backend = backend_val
+    redis_url = os.environ.get("GATEWAY_REDIS_URL") or os.environ.get("REDIS_URL")
+    if redis_url:
+        config.state.redis.url = redis_url.strip()
     return config

@@ -8,7 +8,6 @@ var
 router_data
 results
 tests
-scripts
 router_lab
 **/__pycache__
 .pytest_cache

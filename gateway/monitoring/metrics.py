@@ -1,8 +1,7 @@
-"""Aggregations over the request log, shared by the dashboard, the admin API and alerts.
+"""Aggregations over the request log, shared by the dashboard, admin API and alerts.
 
-Plain SQL plus Python percentiles, so the gateway needs no pandas. Latency
-percentiles cover successful requests; rejected requests (client errors,
-budget limits) are counted but are not errors.
+SQLAlchemy Core builds portable aggregation queries; Python computes latency
+percentiles so the gateway still needs no dataframe or database extension.
 """
 
 from __future__ import annotations
@@ -10,7 +9,11 @@ from __future__ import annotations
 import math
 from typing import Any
 
-from gateway.monitoring.store import Store
+from sqlalchemy import case, func, literal, select
+from sqlalchemy.sql.elements import ColumnElement
+from sqlalchemy.sql.schema import Table
+
+from gateway.monitoring.store import FEEDBACK, REQUESTS, Store
 
 
 def percentile(values: list[float], q: float) -> float | None:
@@ -23,42 +26,57 @@ def percentile(values: list[float], q: float) -> float | None:
     return ordered[low] + (ordered[high] - ordered[low]) * (position - low)
 
 
-def _where(since: str | None = None, until: str | None = None, app_id: str | None = None,
-           prefix: str = "") -> tuple[str, list[Any]]:
-    clauses, params = [], []
+def _conditions(table: Table, since: str | None = None, until: str | None = None,
+                app_id: str | None = None) -> list[ColumnElement[bool]]:
+    conditions = []
     if since:
-        clauses.append(f"{prefix}ts >= ?")
-        params.append(since)
+        conditions.append(table.c.ts >= since)
     if until:
-        clauses.append(f"{prefix}ts < ?")
-        params.append(until)
+        conditions.append(table.c.ts < until)
     if app_id:
-        clauses.append(f"{prefix}app_id = ?")
-        params.append(app_id)
-    return (" WHERE " + " AND ".join(clauses)) if clauses else "", params
+        conditions.append(table.c.app_id == app_id)
+    return conditions
+
+
+def _count_if(condition: ColumnElement[bool]) -> ColumnElement[Any]:
+    """Portable replacement for SQLite's ``SUM(boolean expression)``."""
+    return func.coalesce(func.sum(case((condition, 1), else_=0)), 0)
+
+
+def timestamp_bucket(table: Table, bucket: str) -> ColumnElement[str]:
+    """Return a UTC bucket expression for the existing ISO timestamp text."""
+    if bucket == "day":
+        return table.c.day
+    if bucket == "hour":
+        return func.substr(table.c.ts, 1, 13) + literal(":00")
+    raise ValueError(f"unsupported timestamp bucket: {bucket}")
 
 
 def summary(store: Store, since: str | None = None, until: str | None = None,
             app_id: str | None = None) -> dict[str, Any]:
     """Headline numbers for a time range."""
-    where, params = _where(since, until, app_id)
-    row = store.query(
-        "SELECT COUNT(*) AS requests, "
-        "COALESCE(SUM(status = 'ok'), 0) AS ok, COALESCE(SUM(status = 'error'), 0) AS errors, "
-        "COALESCE(SUM(status = 'rejected'), 0) AS rejected, COALESCE(SUM(cost_usd), 0) AS cost_usd, "
-        "COALESCE(SUM(prompt_tokens + completion_tokens), 0) AS tokens, "
-        "COALESCE(SUM(escalated), 0) AS escalated, COALESCE(SUM(fallback), 0) AS fallbacks, "
-        "COALESCE(SUM(tier = 'strong'), 0) AS strong "
-        f"FROM requests{where}", params)[0]
+    conditions = _conditions(REQUESTS, since, until, app_id)
+    row = store.query(select(
+        func.count().label("requests"),
+        _count_if(REQUESTS.c.status == "ok").label("ok"),
+        _count_if(REQUESTS.c.status == "error").label("errors"),
+        _count_if(REQUESTS.c.status == "rejected").label("rejected"),
+        func.coalesce(func.sum(REQUESTS.c.cost_usd), 0).label("cost_usd"),
+        func.coalesce(func.sum(REQUESTS.c.prompt_tokens + REQUESTS.c.completion_tokens), 0).label("tokens"),
+        func.coalesce(func.sum(REQUESTS.c.escalated), 0).label("escalated"),
+        func.coalesce(func.sum(REQUESTS.c.fallback), 0).label("fallbacks"),
+        _count_if(REQUESTS.c.tier == "strong").label("strong"),
+    ).where(*conditions))[0]
     latencies = [r["latency_ms"] for r in store.query(
-        f"SELECT latency_ms FROM requests{where}{' AND' if where else ' WHERE'} status = 'ok' "
-        "AND latency_ms IS NOT NULL", params)]
+        select(REQUESTS.c.latency_ms).where(
+            *conditions, REQUESTS.c.status == "ok", REQUESTS.c.latency_ms.is_not(None)))]
     router_ms = [r["router_ms"] for r in store.query(
-        f"SELECT router_ms FROM requests{where}{' AND' if where else ' WHERE'} router_ms IS NOT NULL", params)]
-    fb_where, fb_params = _where(since, until, app_id)
-    feedback = store.query(
-        f"SELECT COALESCE(SUM(score = 1), 0) AS up, COALESCE(SUM(score = -1), 0) AS down FROM feedback{fb_where}",
-        fb_params)[0]
+        select(REQUESTS.c.router_ms).where(*conditions, REQUESTS.c.router_ms.is_not(None)))]
+    feedback_conditions = _conditions(FEEDBACK, since, until, app_id)
+    feedback = store.query(select(
+        _count_if(FEEDBACK.c.score == 1).label("up"),
+        _count_if(FEEDBACK.c.score == -1).label("down"),
+    ).where(*feedback_conditions))[0]
     counted = row["ok"] + row["errors"]
     answered = row["ok"] or 0
     return {
@@ -74,23 +92,24 @@ def summary(store: Store, since: str | None = None, until: str | None = None,
     }
 
 
-_BUCKETS = {"day": "day", "hour": "substr(ts, 1, 13) || ':00'"}
-
-
 def timeseries(store: Store, since: str | None = None, app_id: str | None = None,
                bucket: str = "day") -> list[dict[str, Any]]:
-    """One row per UTC day (or hour): requests, errors, error rate, cost, p50/p95 latency."""
-    key = _BUCKETS[bucket]
-    where, params = _where(since, None, app_id)
-    rows = store.query(
-        f"SELECT {key} AS bucket, COUNT(*) AS requests, COALESCE(SUM(status = 'error'), 0) AS errors, "
-        "COALESCE(SUM(status = 'rejected'), 0) AS rejected, COALESCE(SUM(status = 'ok'), 0) AS ok, "
-        "COALESCE(SUM(cost_usd), 0) AS cost_usd, COALESCE(SUM(prompt_tokens + completion_tokens), 0) AS tokens "
-        f"FROM requests{where} GROUP BY bucket ORDER BY bucket", params)
+    """One row per UTC day (or hour): requests, errors, cost and latency."""
+    key = timestamp_bucket(REQUESTS, bucket).label("bucket")
+    conditions = _conditions(REQUESTS, since, app_id=app_id)
+    rows = store.query(select(
+        key,
+        func.count().label("requests"),
+        _count_if(REQUESTS.c.status == "error").label("errors"),
+        _count_if(REQUESTS.c.status == "rejected").label("rejected"),
+        _count_if(REQUESTS.c.status == "ok").label("ok"),
+        func.coalesce(func.sum(REQUESTS.c.cost_usd), 0).label("cost_usd"),
+        func.coalesce(func.sum(REQUESTS.c.prompt_tokens + REQUESTS.c.completion_tokens), 0).label("tokens"),
+    ).where(*conditions).group_by(key).order_by(key))
     latencies: dict[str, list[float]] = {}
-    for r in store.query(f"SELECT {key} AS bucket, latency_ms FROM requests{where}{' AND' if where else ' WHERE'} "
-                         "status = 'ok' AND latency_ms IS NOT NULL", params):
-        latencies.setdefault(r["bucket"], []).append(r["latency_ms"])
+    for row in store.query(select(key, REQUESTS.c.latency_ms).where(
+            *conditions, REQUESTS.c.status == "ok", REQUESTS.c.latency_ms.is_not(None))):
+        latencies.setdefault(row["bucket"], []).append(row["latency_ms"])
     for row in rows:
         counted = row["ok"] + row["errors"]
         row["error_rate"] = row["errors"] / counted if counted else 0.0
@@ -100,78 +119,101 @@ def timeseries(store: Store, since: str | None = None, app_id: str | None = None
 
 
 def daily(store: Store, since: str | None = None, app_id: str | None = None) -> list[dict[str, Any]]:
-    """One row per UTC day (``day`` key): requests, errors, error rate, cost, p50/p95 latency."""
+    """One row per UTC day (``day`` key)."""
     return [{"day": row.pop("bucket"), **row} for row in timeseries(store, since, app_id, "day")]
 
 
 def app_ids(store: Store) -> list[str]:
-    return [r["app_id"] for r in store.query("SELECT DISTINCT app_id FROM requests ORDER BY app_id")]
+    statement = select(REQUESTS.c.app_id).distinct().order_by(REQUESTS.c.app_id)
+    return [row["app_id"] for row in store.query(statement)]
 
 
 def model_share(store: Store, since: str | None = None, app_id: str | None = None) -> list[dict[str, Any]]:
     """Share of answered requests per model (and tier)."""
-    where, params = _where(since, None, app_id)
-    rows = store.query(
-        f"SELECT model, tier, COUNT(*) AS requests, COALESCE(SUM(cost_usd), 0) AS cost_usd FROM requests{where}"
-        f"{' AND' if where else ' WHERE'} status = 'ok' GROUP BY model, tier ORDER BY requests DESC", params)
-    total = sum(r["requests"] for r in rows)
-    for r in rows:
-        r["share"] = r["requests"] / total if total else 0.0
+    conditions = _conditions(REQUESTS, since, app_id=app_id)
+    rows = store.query(select(
+        REQUESTS.c.model,
+        REQUESTS.c.tier,
+        func.count().label("requests"),
+        func.coalesce(func.sum(REQUESTS.c.cost_usd), 0).label("cost_usd"),
+    ).where(*conditions, REQUESTS.c.status == "ok").group_by(
+        REQUESTS.c.model, REQUESTS.c.tier).order_by(func.count().desc()))
+    total = sum(row["requests"] for row in rows)
+    for row in rows:
+        row["share"] = row["requests"] / total if total else 0.0
     return rows
 
 
 def release_stats(store: Store, since: str | None = None) -> list[dict[str, Any]]:
     """Stable vs canary: requests, error rate, latency, cost and feedback per release."""
-    where, params = _where(since, None, None, prefix="r.")
-    rows = store.query(
-        "SELECT r.release, r.canary, COUNT(*) AS requests, COALESCE(SUM(r.status = 'error'), 0) AS errors, "
-        "COALESCE(SUM(r.status = 'ok'), 0) AS ok, COALESCE(SUM(r.cost_usd), 0) AS cost_usd, "
-        "COALESCE(SUM(f.up), 0) AS feedback_up, COALESCE(SUM(f.down), 0) AS feedback_down "
-        "FROM requests r LEFT JOIN (SELECT request_id, SUM(score = 1) AS up, SUM(score = -1) AS down "
-        f"FROM feedback GROUP BY request_id) f ON f.request_id = r.id{where} "
-        "GROUP BY r.release, r.canary ORDER BY r.canary, r.release", params)
+    feedback = select(
+        FEEDBACK.c.request_id,
+        _count_if(FEEDBACK.c.score == 1).label("up"),
+        _count_if(FEEDBACK.c.score == -1).label("down"),
+    ).group_by(FEEDBACK.c.request_id).subquery()
+    conditions = _conditions(REQUESTS, since)
+    rows = store.query(select(
+        REQUESTS.c.release,
+        REQUESTS.c.canary,
+        func.count().label("requests"),
+        _count_if(REQUESTS.c.status == "error").label("errors"),
+        _count_if(REQUESTS.c.status == "ok").label("ok"),
+        func.coalesce(func.sum(REQUESTS.c.cost_usd), 0).label("cost_usd"),
+        func.coalesce(func.sum(feedback.c.up), 0).label("feedback_up"),
+        func.coalesce(func.sum(feedback.c.down), 0).label("feedback_down"),
+    ).select_from(REQUESTS.outerjoin(feedback, feedback.c.request_id == REQUESTS.c.id)).where(
+        *conditions).group_by(REQUESTS.c.release, REQUESTS.c.canary).order_by(
+            REQUESTS.c.canary, REQUESTS.c.release))
     for row in rows:
         counted = row["ok"] + row["errors"]
         row["error_rate"] = row["errors"] / counted if counted else 0.0
-        latencies = [r["latency_ms"] for r in store.query(
-            f"SELECT latency_ms FROM requests r{where}{' AND' if where else ' WHERE'} r.release IS ? "
-            "AND r.canary = ? AND r.status = 'ok' AND r.latency_ms IS NOT NULL",
-            [*params, row["release"], row["canary"]])]
+        release_match = (REQUESTS.c.release.is_(None) if row["release"] is None
+                         else REQUESTS.c.release == row["release"])
+        latencies = [item["latency_ms"] for item in store.query(select(REQUESTS.c.latency_ms).where(
+            *conditions, release_match, REQUESTS.c.canary == row["canary"], REQUESTS.c.status == "ok",
+            REQUESTS.c.latency_ms.is_not(None)))]
         row["p50_ms"] = percentile(latencies, 50)
         rated = row["feedback_up"] + row["feedback_down"]
         row["thumbs_up_rate"] = row["feedback_up"] / rated if rated else None
     return rows
 
 
-def latency_class_stats(store: Store, since: str | None = None, app_id: str | None = None) -> list[dict[str, Any]]:
-    """Per latency class: requests, error rate, fallbacks, cost and p50/p95 latency of successful requests."""
-    where, params = _where(since, None, app_id)
-    rows = store.query(
-        "SELECT COALESCE(latency_class, 'not recorded') AS latency_class, COUNT(*) AS requests, "
-        "COALESCE(SUM(status = 'ok'), 0) AS ok, COALESCE(SUM(status = 'error'), 0) AS errors, "
-        "COALESCE(SUM(fallback), 0) AS fallbacks, COALESCE(SUM(cost_usd), 0) AS cost_usd "
-        f"FROM requests{where} GROUP BY 1 ORDER BY 1", params)
+def latency_class_stats(store: Store, since: str | None = None,
+                        app_id: str | None = None) -> list[dict[str, Any]]:
+    """Per latency class: requests, errors, fallbacks, cost and latency."""
+    conditions = _conditions(REQUESTS, since, app_id=app_id)
+    latency_class = func.coalesce(REQUESTS.c.latency_class, "not recorded").label("latency_class")
+    rows = store.query(select(
+        latency_class,
+        func.count().label("requests"),
+        _count_if(REQUESTS.c.status == "ok").label("ok"),
+        _count_if(REQUESTS.c.status == "error").label("errors"),
+        func.coalesce(func.sum(REQUESTS.c.fallback), 0).label("fallbacks"),
+        func.coalesce(func.sum(REQUESTS.c.cost_usd), 0).label("cost_usd"),
+    ).where(*conditions).group_by(latency_class).order_by(latency_class))
     for row in rows:
         counted = row["ok"] + row["errors"]
         row["error_rate"] = row["errors"] / counted if counted else 0.0
-        latencies = [r["latency_ms"] for r in store.query(
-            f"SELECT latency_ms FROM requests{where}{' AND' if where else ' WHERE'} "
-            "COALESCE(latency_class, 'not recorded') = ? AND status = 'ok' AND latency_ms IS NOT NULL",
-            [*params, row["latency_class"]])]
+        latencies = [item["latency_ms"] for item in store.query(select(REQUESTS.c.latency_ms).where(
+            *conditions, func.coalesce(REQUESTS.c.latency_class, "not recorded") == row["latency_class"],
+            REQUESTS.c.status == "ok", REQUESTS.c.latency_ms.is_not(None)))]
         row["p50_ms"] = percentile(latencies, 50)
         row["p95_ms"] = percentile(latencies, 95)
     return rows
 
 
 def app_spend(store: Store, day: str) -> list[dict[str, Any]]:
-    return store.query("SELECT app_id, COUNT(*) AS requests, COALESCE(SUM(cost_usd), 0) AS cost_usd "
-                       "FROM requests WHERE day = ? GROUP BY app_id ORDER BY cost_usd DESC", (day,))
+    cost = func.coalesce(func.sum(REQUESTS.c.cost_usd), 0).label("cost_usd")
+    return store.query(select(
+        REQUESTS.c.app_id, func.count().label("requests"), cost,
+    ).where(REQUESTS.c.day == day).group_by(REQUESTS.c.app_id).order_by(cost.desc()))
 
 
 def recent(store: Store, limit: int = 50, app_id: str | None = None) -> list[dict[str, Any]]:
-    where, params = _where(None, None, app_id)
-    return store.query(
-        "SELECT ts, id, app_id, release, canary, mode, router, route_score, latency_class, tier, model, escalated, "
-        "fallback, "
-        "prompt_tokens, completion_tokens, cost_usd, latency_ms, router_ms, status, http_status, error_type "
-        f"FROM requests{where} ORDER BY ts DESC LIMIT ?", [*params, limit])
+    columns = [REQUESTS.c[name] for name in (
+        "ts", "id", "app_id", "release", "canary", "mode", "router", "route_score", "latency_class",
+        "tier", "model", "escalated", "fallback", "prompt_tokens", "completion_tokens", "cost_usd",
+        "latency_ms", "router_ms", "status", "http_status", "error_type",
+    )]
+    return store.query(select(*columns).where(
+        *_conditions(REQUESTS, app_id=app_id)).order_by(REQUESTS.c.ts.desc()).limit(limit))
