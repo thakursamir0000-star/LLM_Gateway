@@ -89,10 +89,15 @@ def test_log_naming_an_unknown_release_falls_back_to_config(config):
 def test_cli(tmp_path, monkeypatch, capsys):
     import yaml
 
+    from gateway.migrations import sqlite_url, upgrade_database
     from tests.conftest import BASE_CONFIG
 
+    monkeypatch.delenv("GATEWAY_DATABASE_URL", raising=False)
+    db_file = tmp_path / "gw.db"
+    upgrade_database(sqlite_url(db_file))
+
     path = tmp_path / "gateway.yaml"
-    path.write_text(yaml.safe_dump({**BASE_CONFIG, "storage": {"db_path": str(tmp_path / "gw.db")}}))
+    path.write_text(yaml.safe_dump({**BASE_CONFIG, "storage": {"db_path": str(db_file)}}))
     assert cli(["--config", str(path), "status"]) == 0
     assert "active:  v1" in capsys.readouterr().out
     assert cli(["--config", str(path), "canary", "v2", "0.1"]) == 0

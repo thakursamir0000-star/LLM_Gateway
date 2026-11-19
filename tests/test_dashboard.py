@@ -6,6 +6,7 @@ import pytest
 import yaml
 
 from gateway.config import ROOT
+from gateway.migrations import sqlite_url, upgrade_database
 from gateway.monitoring.store import CallRecord, RequestRecord, Store, iso, utc_now
 
 AppTest = pytest.importorskip("streamlit.testing.v1").AppTest
@@ -30,6 +31,7 @@ def test_dashboard_deployment_is_loopback_only_and_keeps_local_healthcheck():
 
 
 def populate(path):
+    upgrade_database(sqlite_url(path))
     store = Store(path)
     now = utc_now()
     for i in range(30):
@@ -52,6 +54,7 @@ def populate(path):
 
 
 def test_dashboard_without_a_database(tmp_path, monkeypatch):
+    monkeypatch.delenv("GATEWAY_DATABASE_URL", raising=False)
     monkeypatch.setenv("GATEWAY_DB", str(tmp_path / "missing.db"))
     at = AppTest.from_file(DASHBOARD, default_timeout=60).run()
     assert not at.exception
@@ -59,6 +62,7 @@ def test_dashboard_without_a_database(tmp_path, monkeypatch):
 
 
 def test_dashboard_with_traffic(tmp_path, monkeypatch):
+    monkeypatch.delenv("GATEWAY_DATABASE_URL", raising=False)
     db = tmp_path / "gw.db"
     populate(db)
     monkeypatch.setenv("GATEWAY_DB", str(db))
