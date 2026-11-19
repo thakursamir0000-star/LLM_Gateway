@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import argparse
 import json
-from pathlib import Path
 import sqlite3
 import sys
 from collections import defaultdict
 from datetime import UTC, datetime
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 
 # Ensure project root is importable when executed directly as a script

@@ -35,8 +35,20 @@ class FakeDegradedState(StateBackend):
         pass
 
 
-def test_ready_endpoint_healthy(tmp_path):
-    client = TestClient(create_app(load_config()))
+def _make_isolated_app(tmp_path, monkeypatch, *, state=None):
+    monkeypatch.delenv("GATEWAY_ENV", raising=False)
+    monkeypatch.delenv("GATEWAY_DATABASE_URL", raising=False)
+    monkeypatch.delenv("GATEWAY_STATE_BACKEND", raising=False)
+    monkeypatch.delenv("GATEWAY_REDIS_URL", raising=False)
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    config = load_config()
+    config.storage.db_path = str(tmp_path / "gateway.db")
+    config.state.backend = "memory"
+    return create_app(config, state=state)
+
+
+def test_ready_endpoint_healthy(tmp_path, monkeypatch):
+    client = TestClient(_make_isolated_app(tmp_path, monkeypatch))
     r = client.get("/ready")
     assert r.status_code == 200
     data = r.json()
@@ -44,9 +56,9 @@ def test_ready_endpoint_healthy(tmp_path):
     assert data["database"]["ok"] is True
 
 
-def test_ready_endpoint_returns_503_when_state_backend_unready():
+def test_ready_endpoint_returns_503_when_state_backend_unready(tmp_path, monkeypatch):
     degraded = FakeDegradedState()
-    client = TestClient(create_app(load_config(), state=degraded))
+    client = TestClient(_make_isolated_app(tmp_path, monkeypatch, state=degraded))
     r = client.get("/ready")
     assert r.status_code == 503
     data = r.json()
@@ -54,9 +66,9 @@ def test_ready_endpoint_returns_503_when_state_backend_unready():
     assert data["state_backend"]["ready"] is False
 
 
-def test_health_reports_degraded_when_state_degraded():
+def test_health_reports_degraded_when_state_degraded(tmp_path, monkeypatch):
     degraded = FakeDegradedState()
-    client = TestClient(create_app(load_config(), state=degraded))
+    client = TestClient(_make_isolated_app(tmp_path, monkeypatch, state=degraded))
     r = client.get("/health")
     assert r.status_code == 200
     data = r.json()
