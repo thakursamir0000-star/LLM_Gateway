@@ -90,7 +90,9 @@ def create_app(config: GatewayConfig | None = None, *, providers: dict[str, Prov
     registry = ModelRegistry(
         config,
         providers,
-        pacing=not fake,
+        # Fake providers ignore the per-model rate limits unless GATEWAY_FAKE_PACING asks for them (used to test
+        # shared rate limiting across replicas without calling a provider).
+        pacing=not fake or _truthy(os.environ.get("GATEWAY_FAKE_PACING")),
         state=state,
         **({"sleep": sleep} if sleep else {}),
     )

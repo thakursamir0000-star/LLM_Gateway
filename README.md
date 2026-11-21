@@ -1,23 +1,53 @@
 # LLM Gateway
 
-An OpenAI-compatible service that sits between your apps and LLM providers. For each request it picks a model with a
-trained router (cheap model when it is likely good enough, strong model when it is not), and it records and monitors
-every call: tokens, cost, latency, errors, route decisions and user feedback.
+An OpenAI-compatible service that sits between your apps and LLM providers (Groq, OpenRouter, the Gemini API). It
+chooses the model for each request (a cheap or a strong tier, a fast or a cheap provider), falls back across providers
+when one fails, enforces per-app budgets and shared rate limits, and records every call: tokens, cost, latency,
+errors, route decisions and user feedback.
+
+**What decides the model today:** the shipped config routes `model="auto"` to the strong tier, and the latency class
+picks the provider. A trained classifier router exists and has been evaluated offline (8% cheaper than always-strong
+on held-out benchmark questions, a difference in quality the test can't distinguish from zero; see
+[Results](#results)), but it is **not installed or active**: `model="router"` uses the rule-based router.
 
 An app switches to it by changing one URL:
 
 ```python
 from openai import OpenAI
 
-client = OpenAI(base_url="http://localhost:8000/v1", api_key="unused-without-gateway-keys")
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="my-secret-key")  # a key from GATEWAY_API_KEYS
 reply = client.chat.completions.create(model="auto", messages=[{"role": "user", "content": "What is 17 * 23?"}])
 print(reply.choices[0].message.content)
-print(reply.model_extra["gateway"])  # which model answered, why, and what it cost
+# With GATEWAY_EXPOSE_METADATA=1 the response also has a "gateway" object: model, route, cost.
 ```
 
-**Status:** phase 1. The gateway, routing, monitoring, release management and packaging are built and tested, with
-fake providers or mocked HTTP. OpenRouter label collection is complete for all 1,200 questions, and the trained
-router has been evaluated on the fixed 300-question held-out split. See [Results](#results).
+**Status:** Phases 1–3 (gateway, routing, monitoring, releases, security, streaming, circuit breakers, PostgreSQL,
+Redis, Alembic, multiple replicas) are built and tested with fake providers and mocked HTTP. Phase 4 (verification) is
+in progress: PostgreSQL 16 integration tests, Redis outage drills and a two-replica Docker validation pass, and a
+real-provider smoke test through the gateway's HTTP API passed on 2026-11-22 (Groq, OpenRouter, a forced fallback and
+streaming; $0.000089; [`results/real_provider_smoke.json`](results/real_provider_smoke.json)). Nothing is deployed.
+See [Validation status](#validation-status).
+
+## Validation status
+
+| Capability | Implemented | Unit tested | Integration tested | Real-provider tested | Deployed |
+|---|---|---|---|---|---|
+| OpenAI-compatible chat API (JSON and SSE streaming) | yes | yes | yes: two replicas in Docker, SSE through nginx (fake providers) | yes: smoke test, JSON and streaming (one run each) | no |
+| Groq and OpenRouter adapters | yes | yes (mocked HTTP) | – | yes: smoke test through the HTTP API, plus the router lab's 3,155 answers through the model registry | no |
+| Gemini API adapter | yes | yes (mocked HTTP) | – | no | no |
+| Retries, fallback, quota cooldowns, circuit breakers | yes | yes | yes: shared across two replicas through Redis | fallback only: Groq 401 → OpenRouter in the smoke test | no |
+| Rules router, cascade | yes | yes | – | no | no |
+| Trained classifier router | yes, **not active** | yes | offline held-out evaluation | on real benchmark answers, offline | no |
+| Per-app budgets with atomic reservations | yes | yes | yes: PostgreSQL 16, two replicas | no | no |
+| Request log, metrics, alerts | yes | yes | yes: PostgreSQL 16 | no | no |
+| Releases, canary, rollback | yes | yes | yes: PostgreSQL 16, concurrent changes | – | no |
+| PostgreSQL storage and Alembic migrations | yes | – | yes: 25 tests on PostgreSQL 16 in CI | – | no |
+| Redis shared state and outage policy | yes | yes | yes: real Redis 7, outage drill | – | no |
+| Authentication, admin key, body limits, CORS, generic upstream errors | yes | yes | yes: 401 without a key in the Docker smoke test | – | no |
+| Prometheus metrics, HTTPS entry point, per-client rate limits, backups | **no** | – | – | – | – |
+
+"Integration tested" means against real PostgreSQL, Redis or Docker Compose (`tests/test_postgres_integration.py`,
+`tests/test_redis_*.py`, `scripts/redis_outage_drill.py`, `scripts/multi_instance_check.py`).
 
 ## What it does
 
@@ -28,17 +58,19 @@ router has been evaluated on the fixed 300-question held-out split. See [Results
   (Gemini and Gemma models). Calls are paced under each model's limits and retried within bounds; provider errors are
   stripped of account ids and keys before they are logged or returned.
 - **Routing modes**, chosen per request with the `model` field:
-  `cheap`, `strong`, `router` (trained classifier, or a rule-based baseline) and `cascade` (cheap first, escalate when
-  the answer looks unsure). `auto` uses the configured default.
+  `cheap`, `strong`, `router` (the rule-based router; the trained classifier only once it is installed) and `cascade`
+  (cheap first, escalate when the answer looks unsure). `auto` uses the configured default (`strong`).
 - **Latency-aware provider routing**: `interactive` requests go to fast models (Groq), `batch` requests to cheaper,
   slower ones (OpenRouter), with fallback across providers and a cooldown for a model that is out of quota.
 - **Audited cost/quality controls**: separate classifier and rules/cascade defaults in `[0, 1]`. Higher sends more
   traffic to the strong model, and the classifier default must match its trained artifact.
-- **Monitoring**: every request is logged to SQLite (model, route decision, tokens, cost, latency, error; never the
-  prompt or the answer). A Streamlit dashboard shows requests, cost per day, p50/p95 latency, error rate and the share
+- **Monitoring**: every request is logged to SQLite (development) or PostgreSQL (model, route decision, tokens, cost,
+  latency, error; never the prompt or the answer). A Streamlit dashboard shows requests, cost per day, p50/p95 latency, error rate and the share
   per model. Alerts fire when the error rate or daily cost passes a limit.
 - **Release management**: model and prompt versions live in the config as releases; activate, roll back, or canary a
-  share of traffic to a new release. Per-app daily budgets.
+  share of traffic to a new release. Per-app daily budgets with atomic reservations.
+- **Several replicas**: PostgreSQL holds the request log, budgets and release state; Redis holds rate limits, quota
+  cooldowns and circuit breakers, so every replica enforces the same limits. Alembic manages the schema.
 - **Router lab**: scripts to collect benchmark labels (GSM8K, MMLU) from both models, train the router, and compare it
   with always-cheap, always-strong and random routing on held-out questions.
 
@@ -56,7 +88,8 @@ flowchart LR
     Reg --> OpenRouter["OpenRouter<br/>gpt-oss-20b / 120b<br/>(pinned host)"]
     Reg --> Gemini["Gemini API<br/>Gemini / Gemma"]
     Svc --> Check["Cascade check<br/>escalate if unsure"]
-    Svc --> DB[("SQLite<br/>requests, calls, feedback,<br/>deployments, alerts")]
+    Svc --> DB[("SQLite (dev) or PostgreSQL<br/>requests, calls, feedback,<br/>deployments, alerts, budgets")]
+    Reg --> Redis[("Redis (multi-replica)<br/>rate limits, cooldowns,<br/>circuit breakers")]
     Svc --> Alerts["Alerts<br/>log + webhook"]
     DB --> Dash["Streamlit dashboard"]
     Lab["Router lab scripts"] -->|"answers.jsonl"| Train["train_router.py"] -->|"models/router.json"| Router
@@ -81,10 +114,10 @@ What happens to one request (`gateway/service.py`):
 9. **Log** one row per request (including its latency class) and one per provider call; check alerts (at most once a
    minute).
 
-The response is a normal `chat.completion` with an extra `gateway` object (request id, release, canary, mode, router,
-score, threshold, latency class, tier, model, escalation, fallback, cost, router time, reason) and `x-gateway-*`
-headers. `usage`
-counts every provider call the request made (a cascade escalation pays for two).
+The response is a normal `chat.completion` with an `x-gateway-request-id` header. With `GATEWAY_EXPOSE_METADATA=1`
+it also carries a `gateway` object (request id, release, canary, mode, router, score, threshold, latency class, tier,
+model, escalation, fallback, cost, router time, reason) and more `x-gateway-*` headers; they are hidden by default.
+`usage` counts every provider call the request made (a cascade escalation pays for two).
 
 ## Quick start
 
@@ -102,10 +135,11 @@ source .venv/bin/activate     # Windows: .venv\Scripts\activate
 pip install -r requirements-dev.txt
 ```
 
-**Without API keys** (fake models, nothing leaves your machine):
+**Without API keys** (fake models, nothing leaves your machine; anonymous access so the demo script's `X-App-Id`
+header identifies the app, which is refused when `GATEWAY_ENV=production`):
 
 ```bash
-GATEWAY_FAKE_PROVIDERS=1 python -m gateway
+GATEWAY_FAKE_PROVIDERS=1 GATEWAY_ALLOW_ANONYMOUS=1 python -m gateway
 ```
 
 ```bash
@@ -126,8 +160,8 @@ curl http://127.0.0.1:8000/v1/chat/completions \
   -d '{"model": "auto", "messages": [{"role": "user", "content": "Explain step by step why the sky is blue."}]}'
 ```
 
-**Docker** (gateway on :8000, dashboard restricted to the host's loopback interface, sharing the request log in a
-volume):
+**Docker** (PostgreSQL, Redis, migrations, two gateway replicas on :8000 and :8001, dashboard on the host's loopback
+interface; see [Docker & Multi-Instance Deployment](#6-docker--multi-instance-deployment)):
 
 ```bash
 docker compose up --build
@@ -468,20 +502,38 @@ OpenRouter calls hit the host's rate limit and succeeded on a rerun.
 | `POST /v1/chat/completions` | OpenAI chat completions (`stream: true` streams tokens as server-sent events, see [Streaming](#streaming)) |
 | `GET /v1/models` | routing modes and configured models |
 | `POST /v1/feedback` | thumbs up/down for a request id |
-| `GET /health` | status, active release, canary, router in use |
-| `/admin/*` | status, activate, rollback, canary (needs `GATEWAY_ADMIN_KEY`) |
+| `GET /health` | liveness: status (`ok` or `degraded`), active release, canary, router in use, state backend |
+| `GET /ready` | readiness: 200 when the database and the state backend (Redis) answer, 503 otherwise |
+| `/admin/*` | status, activate, rollback, canary (needs `GATEWAY_ADMIN_KEY` in `X-Admin-Key`; off when unset) |
 
-Request headers: `X-App-Id` (app name, when no gateway keys are configured), `X-Gateway-Threshold` (per-request
-threshold), `X-Gateway-Latency` (`interactive` or `batch`). Response headers: `x-gateway-request-id`, `x-gateway-model`, `x-gateway-tier`, `x-gateway-release`,
-`x-gateway-cost-usd`.
+Request headers: `Authorization: Bearer <key>` (a key from `GATEWAY_API_KEYS`; it names the app), `X-App-Id` (the app
+name, only when anonymous access is enabled), `X-Gateway-Threshold` (per-request threshold), `X-Gateway-Latency`
+(`interactive` or `batch`). Response headers: `x-gateway-request-id` always; `x-gateway-model`, `x-gateway-tier` and
+`x-gateway-release` only with `GATEWAY_EXPOSE_METADATA=1`.
 
 ## Configuration
 
 Everything is in [`config/gateway.yaml`](config/gateway.yaml), validated at startup (unknown keys and broken references
 are errors): models with prices and per-minute limits, providers, prompt versions, releases, routing, retries, budgets,
-alerts, auth and storage. Environment variables are listed in [`.env.example`](.env.example). Groq prices are on-demand
-list prices and change; check them before quoting costs. The Gemini API models have no price set (free tier), so their
-cost shows as 0.
+alerts, auth, security, state and storage. Groq prices are on-demand list prices and change; check them before quoting
+costs. The Gemini API models have no price set (free tier), so their cost shows as 0. Environment variables (also in
+[`.env.example`](.env.example)):
+
+| Variable | Purpose |
+|---|---|
+| `GROQ_API_KEY`, `OPENROUTER_API_KEY`, `GEMINI_API_KEY` | provider keys (names set by `providers.*.api_key_env`) |
+| `GATEWAY_API_KEYS` | client keys, `app:key,app:key`; required unless anonymous access is enabled |
+| `GATEWAY_ADMIN_KEY` | enables `/admin/*` (sent as `X-Admin-Key`) |
+| `GATEWAY_ALLOW_ANONYMOUS` | `1` lets `X-App-Id` identify the app without a key (refused in production) |
+| `GATEWAY_ENV` | `production` turns on the start-up guards: PostgreSQL, Redis, client and admin keys, no anonymous access |
+| `GATEWAY_DATABASE_URL` | SQLAlchemy URL, e.g. `postgresql+psycopg://user:pass@host:5432/gateway`; unset: SQLite at `GATEWAY_DB` |
+| `GATEWAY_DB` | SQLite path for development (default `var/gateway.db`) |
+| `GATEWAY_STATE_BACKEND`, `GATEWAY_REDIS_URL` | `redis` and its URL for shared state across replicas (default `memory`) |
+| `GATEWAY_REDIS_OUTAGE_POLICY`, `GATEWAY_REPLICAS` | `fail_closed` (default) or `local_share`, and the replica count it divides limits by |
+| `GATEWAY_MAX_BODY_BYTES`, `GATEWAY_CORS_ORIGINS`, `GATEWAY_EXPOSE_METADATA` | request size limit, allowed CORS origins, internal metadata in responses |
+| `GATEWAY_CONFIG`, `GATEWAY_HOST`, `GATEWAY_PORT`, `LOG_LEVEL` | config file, bind address and port, log level |
+| `GATEWAY_FAKE_PROVIDERS`, `GATEWAY_FAKE_PACING` | fake models instead of real providers; make them honour rate limits (testing) |
+| `ALERT_WEBHOOK_URL` | alerts are POSTed here as JSON |
 
 ## Development
 
@@ -493,26 +545,21 @@ pytest
 ruff check .
 ```
 
-The tests never call a real API: providers are fakes, and the Groq and Gemini adapters are tested against httpx mock
-transports. One test drives the gateway with the OpenAI SDK by changing only `base_url`; another renders the dashboard
-headless with Streamlit's `AppTest`. CI (`.github/workflows/ci.yml`) runs lint and tests on Python 3.11 and 3.12,
-builds the Docker image, and smoke-tests the gateway and the dashboard containers with fake providers.
+With PostgreSQL and Redis (each test uses its own database; Redis tests flush the database number they use):
 
+```bash
+TEST_POSTGRES_URL=postgresql+psycopg://user:pass@localhost:5432/gateway_test GATEWAY_REDIS_URL=redis://localhost:56379/0 pytest
 ```
-gateway/            the service
-  app.py            FastAPI app and endpoints
-  service.py        the request pipeline
-  config.py         config schema and loading
-  providers/        Groq, OpenRouter and Gemini adapters, fake provider, model registry (pacing, retries)
-  routing/          rules, embeddings, logistic regression, classifier, cascade check
-  monitoring/       SQLite store, metrics, alerts
-  manage/           releases (activate, rollback, canary), budgets, CLI
-dashboard/app.py    Streamlit dashboard
-router_lab/         questions and grading, resumable collection, labels, evaluation, provider comparison
-scripts/            prepare_questions, collect_labels, train_router, evaluate_router, compare_providers, send_demo_traffic
-config/gateway.yaml configuration
-tests/              pytest suite
-```
+
+The tests never call a real API: providers are fakes, and the Groq, OpenRouter and Gemini adapters are tested against
+httpx mock transports. One test drives the gateway with the OpenAI SDK by changing only `base_url`; another renders
+the dashboard headless with Streamlit's `AppTest`. Without `TEST_POSTGRES_URL` the PostgreSQL tests skip, and without
+Redis the Redis tests skip; in GitHub Actions the PostgreSQL tests fail instead of skipping.
+
+**CI** (`.github/workflows/ci.yml`), on Python 3.11 and 3.12 with PostgreSQL 16 and Redis 7 services: Ruff, the
+PostgreSQL 16 integration tests as their own step, then the rest of the suite (Redis tests included). A second job
+builds the image and smoke-tests a Compose stack with two replicas and fake providers: health and readiness on both,
+401 without a key, answers on both replicas, the dashboard.
 
 ## Production Architecture (Phase 3)
 
@@ -548,15 +595,16 @@ Schema evolution is managed using Alembic:
 # Apply pending migrations to head
 python -m gateway.migrations upgrade head
 
-# Check current revision
-python -m gateway.migrations current
+# Check that the database is at the head revision (the gateway refuses to start otherwise)
+python -m gateway.migrations verify
 
-# Validate database revision matches head
-python -m gateway.migrations check
+# Adopt a database created before Alembic, then upgrade it
+python -m gateway.migrations upgrade --adopt-existing
 
-# Downgrade schema (requires explicit confirmation)
+# Downgrade schema (destructive; requires explicit confirmation)
 python -m gateway.migrations downgrade <revision> --confirm-destructive
 ```
+The commands use `GATEWAY_DATABASE_URL` (or `--database-url`), else the SQLite file at `GATEWAY_DB`.
 
 ### 5. SQLite to PostgreSQL Migration
 Migrate existing SQLite databases to PostgreSQL safely:
@@ -575,16 +623,28 @@ Run the full production stack with two gateway replicas sharing PostgreSQL and R
 # Validate Docker Compose configuration
 docker compose config
 
-# Start all services with fake providers for evaluation
-GATEWAY_FAKE_PROVIDERS=1 docker compose up -d
+# Start all services (put GATEWAY_FAKE_PROVIDERS=1 in .env to run without provider keys)
+docker compose up -d
+
+# Also start the nginx load balancer on port 80 in front of both replicas
+docker compose --profile proxy up -d
 ```
 Services provided:
-- `postgres`: PostgreSQL 16 on `127.0.0.1:5432` with persistent volume `postgres-data`.
-- `redis`: Redis 7 on `127.0.0.1:6379` with `noeviction` policy.
+- `postgres`: PostgreSQL 16 on `127.0.0.1:54320` (container port 5432) with persistent volume `postgres-data`.
+- `redis`: Redis 7 on `127.0.0.1:63790` (container port 6379) with `noeviction` policy.
 - `migrations`: One-shot container that upgrades schema to `head` before gateways start.
 - `gateway`: Primary gateway replica on port `8000`.
 - `gateway-replica`: Second gateway replica on port `8001`.
 - `dashboard`: Streamlit dashboard on `127.0.0.1:8501`.
+- `proxy` (profile `proxy`): nginx on port 80, round-robin over both replicas, response buffering off for SSE.
+
+**Two-replica validation.** `python scripts/multi_instance_check.py` builds the image, starts this stack under its
+own Compose project (`llmgw-mi`) with fake providers, and checks that both replicas share one daily budget, one
+Redis rate limit, provider cooldowns and circuit breakers; that SSE streams through the proxy; that a restarted
+replica comes back with the shared state; and that PostgreSQL connections stay bounded. It prints a JSON report,
+exits 1 on any failure and removes the stack and its volumes afterwards (`--keep` leaves it running). Its test
+config is the shipped one with tiny budgets, one rate-limited model and `GATEWAY_FAKE_PACING=1`, which makes fake
+providers honour rate limits (they ignore them otherwise).
 
 ### 7. Health and Readiness Endpoints
 - `GET /health`: Liveness probe. Returns HTTP 200 with service version, routing config, and state backend health (`"ok"` or `"degraded"`).
@@ -642,16 +702,51 @@ gateway/            the service
 migrations/         Alembic versioned migrations
 dashboard/app.py    Streamlit dashboard
 router_lab/         questions and grading, resumable collection, labels, evaluation
-scripts/            prepare_questions, train_router, migrate_sqlite_to_postgres
+scripts/            router lab (prepare_questions, collect_labels, train_router, evaluate_router, ...),
+                    migrate_sqlite_to_postgres, redis_outage_drill, multi_instance_check, send_demo_traffic
 config/gateway.yaml configuration
 tests/              pytest suite
 ```
 
+## System requirements
+
+- Python 3.11 or 3.12 (CI); 3.13 works locally. Docker with Compose v2 for the full stack.
+- PostgreSQL 16 and Redis 7 for several replicas; SQLite and in-memory state are enough for one development process.
+- Memory and CPU per replica haven't been measured yet (load testing is Phase 5); `WITH_EMBEDDINGS=true` adds CPU torch
+  to the image.
+
+## Troubleshooting
+
+| Symptom | Cause and fix |
+|---|---|
+| `MigrationError: database revision is unversioned` at start-up | the PostgreSQL database isn't migrated: run `python -m gateway.migrations upgrade` (Compose runs the `migrations` service first) |
+| Every request answers 401 `auth_required` | no `GATEWAY_API_KEYS` and anonymous access off: configure keys, or `GATEWAY_ALLOW_ANONYMOUS=1` for local demos |
+| `/ready` answers 503 | the database or Redis is unreachable; `/health` shows which (`state.degraded`) |
+| 429 `rate_limit_exceeded` while Redis is down | the `fail_closed` outage policy at work; restore Redis, or choose `local_share` with `GATEWAY_REPLICAS` |
+| 429 `budget_exceeded` | the app's daily budget (UTC day) is spent or held by requests in progress |
+| PostgreSQL tests skip | set `TEST_POSTGRES_URL` to a test database (its name must contain "test") |
+| `psycopg` fails to import on Windows | a policy blocking native DLLs; run PostgreSQL work in Docker or WSL |
+
+## Production deployment prerequisites
+
+Not met by the repository alone: provide them before exposing the gateway.
+
+- `GATEWAY_ENV=production` with PostgreSQL, Redis (`noeviction`), client keys and an admin key; start-up refuses less.
+- An HTTPS entry point: the bundled nginx `proxy` profile listens on plain HTTP and is for local load balancing.
+- The dashboard has no login: keep it on loopback or behind an authenticating proxy.
+- Backups of PostgreSQL and a retention policy for the request log (none are automated yet).
+- Monitoring beyond `/health`, `/ready` and the dashboard (no Prometheus endpoint yet).
+
 ## Limitations and next steps
 
+- Real providers through the gateway's HTTP API are verified by one smoke run (`scripts/real_provider_smoke.py`, four
+  requests); the test suite itself uses fake providers or mocked HTTP. Gemini has not been called for real.
+- Nothing is deployed. There is no HTTPS entry point, no Prometheus metrics, no per-client rate limit (only daily
+  budgets) and no automated backup or retention.
+- Redis is used through a synchronous client, so each Redis call briefly blocks the event loop.
 - The trained classifier is evaluated (see [Results](#results)) but not shipped: `models/router.json` is not
   committed, so `model="router"` requests use the rule-based router. On the held-out questions it saved 8% against
-  always-strong with no significant accuracy difference.
+  always-strong with no significant accuracy difference, on benchmark questions only.
 - Streaming has no retry or failover after the first chunk, so a provider failure mid-stream ends the answer early
   (with an SSE error event), and cascade mode does not check streamed answers.
 - Text chat only: tools / function calling, images and `n > 1` are rejected with a clear 400.
