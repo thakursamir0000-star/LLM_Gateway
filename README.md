@@ -591,8 +591,32 @@ Services provided:
 - `GET /ready`: Readiness probe. Returns HTTP 200 when PostgreSQL and Redis are both reachable, and HTTP 503 if any required infrastructure is disconnected.
 
 ### 8. Outage and Degraded Behavior
-- **Redis Outage**: If Redis fails, gateway detects connection loss, marks state as degraded, and returns HTTP 503 on `/ready`. When configured for development/fallback, in-memory state is used with visible warnings in `/health`.
+- **Redis Outage**: the gateway marks its state `degraded` in `/health` and answers HTTP 503 on `/ready`. Shared
+  per-model RPM/TPM limits can't be enforced then, so `state.redis.outage_policy` decides (env
+  `GATEWAY_REDIS_OUTAGE_POLICY`):
+  - `fail_closed` (default): calls to models with RPM/TPM limits are refused with HTTP 429 and `Retry-After`
+    (`state.redis.outage_retry_after_s`, default 5 s); models without limits keep working.
+  - `local_share`: each replica enforces `limit // state.redis.replicas` locally (env `GATEWAY_REPLICAS`; set it to
+    the number of gateway replicas).
+
+  No replica ever falls back to the full limit, which would multiply the provider allowance by the replica count.
+  Provider cooldowns and circuit breakers fall back to per-instance state, which only makes each replica more
+  cautious. When Redis comes back, the next call reconnects and `/ready` returns 200.
 - **PostgreSQL Outage**: Budget reservation and persistent request logging fail-closed; unreserved budgeted traffic is refused rather than silently allowed.
+
+#### Redis tests and the outage drill (local)
+```bash
+docker run -d --name gateway-redis -p 127.0.0.1:56379:6379 redis:7-alpine   # the tests' default URL
+pytest tests/test_redis_state.py tests/test_multi_instance.py tests/test_redis_outage.py
+python scripts/redis_outage_drill.py --redis-url redis://127.0.0.1:56379/15 --container gateway-redis
+python scripts/redis_outage_drill.py --redis-url redis://127.0.0.1:56379/15 --container gateway-redis --policy local_share
+docker rm -f gateway-redis
+```
+The Redis tests skip when Redis isn't reachable (set `GATEWAY_REDIS_URL` to use another server; they flush the
+database they use). The drill stops and restarts the container under a running gateway with fake providers and
+prints the measured `/ready`, `/health` and request results for the healthy, outage and recovered phases; it exits
+1 if any expectation fails. `tests/test_redis_outage.py` needs no Redis. Run everything with PostgreSQL too by
+also setting `TEST_POSTGRES_URL` (see `tests/test_postgres_integration.py`).
 
 ### 9. Security Configuration
 - `GATEWAY_API_KEYS="app1:key1,app2:key2"`: Client authentication is fail-closed by default.

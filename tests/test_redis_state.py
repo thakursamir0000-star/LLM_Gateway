@@ -192,10 +192,11 @@ def test_redis_outage_and_degraded_reporting():
         assert status["ready"] is False
         assert status["degraded"] is True
 
-        # Operations fall back to local state rather than crashing unhandled
+        # Shared rate limits can't be enforced: the default outage policy refuses (it never falls back to the
+        # full per-replica limit). Cooldowns and circuit breakers fall back to per-instance state.
         limiter = backend.get_rate_limiter("dead-model", rpm=10, tpm=100)
-        res = limiter.reserve(50)
-        assert res.tokens == 50
+        with pytest.raises(RateLimited):
+            limiter.reserve(50)
 
         cb = backend.get_circuit_breaker("dead-cb", CircuitBreakerConfig())
         allowed, _ = cb.can_execute()
