@@ -179,6 +179,12 @@ class RedisConfig(_Strict):
     socket_timeout_s: float = Field(2.0, gt=0)
     connect_timeout_s: float = Field(2.0, gt=0)
     max_connections: int = Field(50, ge=1)
+    # While Redis is unreachable the shared per-model RPM/TPM limits can't be enforced. fail_closed refuses
+    # calls to rate-limited models (HTTP 429); local_share gives each replica limit // replicas locally.
+    # Never every replica the full limit, which would multiply the provider allowance by the replica count.
+    outage_policy: Literal["fail_closed", "local_share"] = "fail_closed"
+    replicas: int = Field(1, ge=1)
+    outage_retry_after_s: float = Field(5.0, gt=0)
 
 
 class StateConfig(_Strict):
@@ -279,4 +285,11 @@ def load_config(path: str | Path | None = None) -> GatewayConfig:
     redis_url = os.environ.get("GATEWAY_REDIS_URL") or os.environ.get("REDIS_URL")
     if redis_url:
         config.state.redis.url = redis_url.strip()
+    outage_policy = os.environ.get("GATEWAY_REDIS_OUTAGE_POLICY")
+    if outage_policy:
+        config.state.redis.outage_policy = outage_policy.strip().lower()  # type: ignore[assignment]
+        RedisConfig.model_validate(config.state.redis.model_dump())  # reject unknown policies
+    replicas = os.environ.get("GATEWAY_REPLICAS")
+    if replicas:
+        config.state.redis.replicas = max(1, int(replicas))
     return config

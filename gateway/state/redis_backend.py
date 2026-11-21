@@ -330,8 +330,8 @@ class RedisRateLimiter(RateLimiterProtocol):
             return float(res[0])
         except (redis.ConnectionError, redis.TimeoutError) as e:
             self._backend.mark_degraded(e)
-            fb = self._backend.fallback_backend.get_rate_limiter(self.alias, self.rpm, self.tpm)
-            return fb.wait_time(tokens)
+            fb = self._backend.outage_rate_limiter(self.alias, self.rpm, self.tpm)
+            return self._backend.config.outage_retry_after_s if fb is None else fb.wait_time(tokens)
 
     def reserve(self, tokens: int) -> Reservation:
         reservation_id = uuid.uuid4().hex
@@ -344,7 +344,9 @@ class RedisRateLimiter(RateLimiterProtocol):
             return Reservation(t=t, tokens=tokens, model=self.alias, reservation_id=reservation_id)
         except (redis.ConnectionError, redis.TimeoutError) as e:
             self._backend.mark_degraded(e)
-            fb = self._backend.fallback_backend.get_rate_limiter(self.alias, self.rpm, self.tpm)
+            fb = self._backend.outage_rate_limiter(self.alias, self.rpm, self.tpm)
+            if fb is None:
+                raise RateLimited(self._backend.config.outage_retry_after_s) from e
             return fb.reserve(tokens)
 
     def settle(self, reservation: Reservation, tokens: int) -> None:
@@ -357,9 +359,8 @@ class RedisRateLimiter(RateLimiterProtocol):
                 args=[reservation.reservation_id, tokens],
             )
         except (redis.ConnectionError, redis.TimeoutError) as e:
+            # The reservation lives in Redis; it expires with the window, so there is nothing local to settle.
             self._backend.mark_degraded(e)
-            fb = self._backend.fallback_backend.get_rate_limiter(self.alias, self.rpm, self.tpm)
-            fb.settle(reservation, tokens)
 
     async def acquire(
         self,
@@ -382,7 +383,9 @@ class RedisRateLimiter(RateLimiterProtocol):
                     raise RateLimited(wait)
             except (redis.ConnectionError, redis.TimeoutError) as e:
                 self._backend.mark_degraded(e)
-                fb = self._backend.fallback_backend.get_rate_limiter(self.alias, self.rpm, self.tpm)
+                fb = self._backend.outage_rate_limiter(self.alias, self.rpm, self.tpm)
+                if fb is None:
+                    raise RateLimited(self._backend.config.outage_retry_after_s) from e
                 return await fb.acquire(tokens, max_wait=max_wait, sleep=sleep)
             await sleep(wait + 0.05)
 
@@ -541,9 +544,27 @@ class RedisStateBackend(StateBackend):
 
     def mark_degraded(self, error: Exception) -> None:
         if not self._degraded:
-            log.warning("Redis state backend connection failure: %s (using local fallback)", error)
+            log.warning("Redis state backend connection failure: %s (outage policy %s: rate-limited models %s; "
+                        "cooldowns and circuit breakers are per instance)", error, self.config.outage_policy,
+                        "refused" if self.config.outage_policy == "fail_closed"
+                        else f"get 1/{self.config.replicas} of their limits")
         self._degraded = True
         self._last_error = str(error)
+
+    def outage_rate_limiter(self, alias: str, rpm: int, tpm: int) -> RateLimiterProtocol | None:
+        """The limiter to use while Redis is unreachable, or None to refuse the call (fail closed).
+
+        A model without RPM/TPM limits has no shared allowance to protect, so it keeps working. Otherwise
+        ``local_share`` enforces ``limit // replicas`` per replica (at least 1); ``fail_closed`` refuses.
+        Every replica falling back to the full limit would multiply the provider allowance by the replicas.
+        """
+        if not rpm and not tpm:
+            return self.fallback_backend.get_rate_limiter(alias, 0, 0)
+        if self.config.outage_policy == "local_share":
+            def share(limit: int) -> int:
+                return max(1, limit // self.config.replicas) if limit else 0
+            return self.fallback_backend.get_rate_limiter(alias, share(rpm), share(tpm))
+        return None
 
     def cooldown_left(self, alias: str) -> float:
         return self.cooldowns.cooldown_left(alias)
@@ -579,6 +600,7 @@ class RedisStateBackend(StateBackend):
             "ready": ready,
             "distributed": True,
             "degraded": self._degraded,
+            "outage_policy": self.config.outage_policy,
             "last_error": self._last_error if self._degraded else None,
             "url": self.config.url.split("@")[-1],  # hide auth credentials
         }
