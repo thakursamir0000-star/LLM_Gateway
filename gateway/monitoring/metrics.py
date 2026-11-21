@@ -9,11 +9,33 @@ from __future__ import annotations
 import math
 from typing import Any
 
-from sqlalchemy import case, func, literal, select
+from sqlalchemy import Text, case, func, select
+from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.sql.elements import ColumnElement
+from sqlalchemy.sql.functions import FunctionElement
 from sqlalchemy.sql.schema import Table
 
 from gateway.monitoring.store import FEEDBACK, REQUESTS, Store
+
+
+class HourBucket(FunctionElement[str]):
+    """``YYYY-MM-DDTHH:00`` (UTC) for a timestamp column, the same text on every supported database."""
+
+    type = Text()
+    name = "hour_bucket"
+    inherit_cache = True
+
+
+@compiles(HourBucket)
+def _hour_bucket_iso_text(element: HourBucket, compiler: Any, **kw: Any) -> str:
+    # SQLite keeps timestamps as ISO-8601 UTC text ("2026-11-20T10:05:00.000+00:00").
+    return f"substr({compiler.process(element.clauses, **kw)}, 1, 13) || ':00'"
+
+
+@compiles(HourBucket, "postgresql")
+def _hour_bucket_postgresql(element: HourBucket, compiler: Any, **kw: Any) -> str:
+    # PostgreSQL keeps timestamptz, which has no substr(); format the UTC hour instead.
+    return f"""to_char(({compiler.process(element.clauses, **kw)}) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24":00"')"""
 
 
 def percentile(values: list[float], q: float) -> float | None:
@@ -44,11 +66,11 @@ def _count_if(condition: ColumnElement[bool]) -> ColumnElement[Any]:
 
 
 def timestamp_bucket(table: Table, bucket: str) -> ColumnElement[str]:
-    """Return a UTC bucket expression for the existing ISO timestamp text."""
+    """Return a UTC bucket expression: the ``day`` column, or ``YYYY-MM-DDTHH:00`` for hours."""
     if bucket == "day":
         return table.c.day
     if bucket == "hour":
-        return func.substr(table.c.ts, 1, 13) + literal(":00")
+        return HourBucket(table.c.ts)
     raise ValueError(f"unsupported timestamp bucket: {bucket}")
 
 

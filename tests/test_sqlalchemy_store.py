@@ -6,10 +6,11 @@ import sqlite3
 from datetime import UTC, datetime
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import select, text
+from sqlalchemy.dialects import postgresql, sqlite
 
 from gateway.monitoring import metrics
-from gateway.monitoring.store import CallRecord, RequestRecord, Store, iso
+from gateway.monitoring.store import REQUESTS, CallRecord, RequestRecord, Store, iso
 
 NOW = datetime(2026, 11, 19, 10, 45, 12, tzinfo=UTC)
 
@@ -122,3 +123,13 @@ def test_daily_bucketing_uses_the_stored_day(tmp_path):
 def test_postgres_qmark_translation_ignores_quoted_and_commented_question_marks():
     sql = "SELECT '?', \"?\", $tag$?$tag$, ? -- ?\n/* ? */"
     assert Store._postgres_positional_sql(sql) == "SELECT '?', \"?\", $tag$?$tag$, %s -- ?\n/* ? */"
+
+
+def test_hour_bucket_compiles_for_each_database():
+    """PostgreSQL stores timestamptz, which has no substr(): its hour bucket formats the UTC hour instead
+    (regression; the PostgreSQL integration tests check the values against a real server)."""
+    statement = select(metrics.timestamp_bucket(REQUESTS, "hour"))
+    on_postgres = str(statement.compile(dialect=postgresql.dialect()))
+    assert "substr" not in on_postgres
+    assert """to_char((requests.ts) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24":00"')""" in on_postgres
+    assert "substr(requests.ts, 1, 13) || ':00'" in str(statement.compile(dialect=sqlite.dialect()))

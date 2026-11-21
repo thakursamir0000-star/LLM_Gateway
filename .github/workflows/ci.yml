@@ -22,7 +22,7 @@ jobs:
         ports:
           - 5432:5432
         options: >-
-          --health-cmd pg_isready
+          --health-cmd "pg_isready -U gateway -d gateway_test"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 5
@@ -45,11 +45,17 @@ jobs:
         run: pip install -r requirements-dev.txt
       - name: Lint
         run: ruff check .
-      - name: Test (unit, SQLite, PostgreSQL, Redis distributed state, and migrations)
+      - name: PostgreSQL 16 integration tests
+        # Each test creates and drops its own database on this throwaway service. In GitHub Actions the
+        # tests fail (never skip) if TEST_POSTGRES_URL is missing or the server can't be reached.
+        env:
+          TEST_POSTGRES_URL: postgresql+psycopg://gateway:gateway_test_password@localhost:5432/gateway_test
+        run: pytest tests/test_postgres_integration.py -v -rs
+      - name: Test (unit, SQLite, Redis distributed state, and migrations)
         env:
           GATEWAY_DATABASE_URL: postgresql+psycopg://gateway:gateway_test_password@localhost:5432/gateway_test
           GATEWAY_REDIS_URL: redis://localhost:6379/0
-        run: pytest
+        run: pytest --ignore=tests/test_postgres_integration.py
 
   docker:
     name: docker build and multi-instance smoke test

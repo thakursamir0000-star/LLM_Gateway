@@ -537,11 +537,15 @@ class Store:
                     lock_key = f"gateway-budget:{app_id}:{day}"
                     connection.execute(select(func.pg_advisory_xact_lock(func.hashtextextended(lock_key, 0))))
                 connection.execute(delete(BUDGET_RESERVATIONS).where(BUDGET_RESERVATIONS.c.expires_at <= now))
-                spent = float(connection.scalar(select(func.coalesce(func.sum(REQUESTS.c.cost_usd), 0)).where(
-                    REQUESTS.c.day == day, REQUESTS.c.app_id == app_id)) or 0.0)
-                reserved = float(connection.scalar(select(func.coalesce(func.sum(BUDGET_RESERVATIONS.c.amount_usd),
-                                                                          0)).where(
-                    BUDGET_RESERVATIONS.c.day == day, BUDGET_RESERVATIONS.c.app_id == app_id)) or 0.0)
+                # Spend and reservations are read in one statement: under PostgreSQL's READ COMMITTED each
+                # statement sees one snapshot, so a request settled concurrently (its cost logged and its
+                # reservation deleted in one transaction) is counted once, never missed by both reads.
+                spent_sum = select(func.coalesce(func.sum(REQUESTS.c.cost_usd), 0)).where(
+                    REQUESTS.c.day == day, REQUESTS.c.app_id == app_id).scalar_subquery()
+                reserved_sum = select(func.coalesce(func.sum(BUDGET_RESERVATIONS.c.amount_usd), 0)).where(
+                    BUDGET_RESERVATIONS.c.day == day, BUDGET_RESERVATIONS.c.app_id == app_id).scalar_subquery()
+                totals = connection.execute(select(spent_sum.label("spent"), reserved_sum.label("reserved"))).one()
+                spent, reserved = float(totals.spent or 0.0), float(totals.reserved or 0.0)
                 left = limit - spent - reserved
                 admitted = left > 0
                 amount = min(max(estimate, 0.0), left) if admitted else 0.0
