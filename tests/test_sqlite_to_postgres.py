@@ -92,3 +92,17 @@ def test_migration_cli_interface_with_flags(tmp_path, monkeypatch, capsys):
     captured = capsys.readouterr()
     assert '"status": "ok"' in captured.out
     assert report_file.exists()
+
+
+def test_daily_totals_are_compared_within_the_cost_tolerance():
+    """SQLite sums floats, PostgreSQL sums exact NUMERIC: the same costs may differ in the last float digits
+    (regression; exact equality refused every realistic migration)."""
+    from decimal import Decimal
+
+    from scripts.migrate_sqlite_to_postgres import _daily_mismatch
+
+    sqlite_sums = {("2026-11-20", "a"): Decimal(str(0.1 + 0.2))}  # 0.30000000000000004
+    postgres_sums = {("2026-11-20", "a"): Decimal("0.3")}
+    assert _daily_mismatch(sqlite_sums, postgres_sums) == {}
+    assert set(_daily_mismatch(sqlite_sums, {("2026-11-20", "a"): Decimal("0.31")})) == {"2026-11-20/a"}
+    assert set(_daily_mismatch(sqlite_sums, {})) == {"2026-11-20/a"}

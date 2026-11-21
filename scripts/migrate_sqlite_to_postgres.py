@@ -64,6 +64,21 @@ def _daily_totals(connection: Any) -> dict[tuple[str, str], Decimal]:
     return {(str(day), app_id): Decimal(str(cost)) for day, app_id, cost in rows}
 
 
+# SQLite sums float costs and PostgreSQL sums exact NUMERIC(20, 12) ones, so the same costs can differ in the
+# last float digits (0.1 + 0.2 is 0.30000000000000004 in SQLite, 0.3 in PostgreSQL): compare within a bound.
+COST_TOLERANCE = Decimal("0.000000001")
+
+
+def _daily_mismatch(source: dict[tuple[str, str], Decimal],
+                    target: dict[tuple[str, str], Decimal]) -> dict[str, Any]:
+    """Day/app groups missing on one side or whose cost differs by more than COST_TOLERANCE."""
+    mismatch: dict[str, Any] = {}
+    for key in sorted(source.keys() | target.keys()):
+        if key not in source or key not in target or abs(source[key] - target[key]) > COST_TOLERANCE:
+            mismatch["/".join(key)] = {"source": str(source.get(key)), "target": str(target.get(key))}
+    return mismatch
+
+
 def _orphans(connection: Any) -> dict[str, int]:
     call_orphans = connection.scalar(select(func.count()).select_from(
         CALLS.outerjoin(REQUESTS, CALLS.c.request_id == REQUESTS.c.id)
@@ -136,12 +151,13 @@ def migrate(source: Path, target_url: str, *, batch_size: int = 1000,
                     select(func.coalesce(func.sum(REQUESTS.c.cost_usd), 0))) or 0))
                 target_total = Decimal(str(target_connection.scalar(
                     select(func.coalesce(func.sum(REQUESTS.c.cost_usd), 0))) or 0))
-                if abs(source_total - target_total) > Decimal("0.000000001"):
+                if abs(source_total - target_total) > COST_TOLERANCE:
                     raise DataMigrationError(
                         f"cost reconciliation failed: source={source_total}, target={target_total}"
                     )
-                if _daily_totals(source_connection) != _daily_totals(target_connection):
-                    raise DataMigrationError("daily cost reconciliation failed")
+                daily_mismatch = _daily_mismatch(_daily_totals(source_connection), _daily_totals(target_connection))
+                if daily_mismatch:
+                    raise DataMigrationError(f"daily cost reconciliation failed: {daily_mismatch}")
                 target_orphans = _orphans(target_connection)
                 if any(target_orphans.values()):
                     raise DataMigrationError(f"target has foreign-key orphans: {target_orphans}")
