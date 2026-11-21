@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 
 from gateway.app import create_app
 from gateway.config import RedisConfig, load_config
+from gateway.monitoring.store import Store
 from gateway.providers.base import Completion
 from gateway.providers.fake import FakeProvider
 from gateway.ratelimit import RateLimited
@@ -50,19 +51,23 @@ async def test_local_share_gives_each_replica_only_its_part_of_the_limit():
     assert (shared.rpm, shared.tpm) == (10, 3000)  # never the full 30 / 9000 on every replica
 
 
-def test_gateway_answers_429_while_shared_limits_cannot_be_enforced():
+def test_gateway_answers_429_while_shared_limits_cannot_be_enforced(tmp_path):
     config = make_config(models={
         "small": {"provider": "groq", "model": "openai/gpt-oss-20b", "limits": {"rpm": 30}},
         "large": {"provider": "groq", "model": "openai/gpt-oss-120b", "limits": {"rpm": 30}},
         "gemma": {"provider": "gemini", "model": "gemma-4-31b-it"},
     })
     groq = FakeProvider("groq", lambda model, messages, params: Completion("ok", "stop", 5, 5, model))
-    app = create_app(config, providers={"groq": groq, "gemini": FakeProvider("gemini")}, state=backend())
+    # Its own SQLite store, so the test never follows a GATEWAY_DATABASE_URL set in the environment (CI sets one).
+    store = Store(tmp_path / "gateway.db")
+    app = create_app(config, providers={"groq": groq, "gemini": FakeProvider("gemini")}, state=backend(),
+                     store=store)
     with TestClient(app) as client:
         assert client.get("/ready").status_code == 503
         assert client.get("/health").json()["status"] == "degraded"
         response = client.post("/v1/chat/completions", headers={"X-App-Id": "app"},
                                json={"model": "strong", "messages": [{"role": "user", "content": "hi"}]})
+    store.close()
     assert response.status_code == 429 and response.json()["error"]["code"] == "rate_limit_exceeded"
     assert int(response.headers["retry-after"]) >= 5
     assert groq.calls == []  # nothing reached the provider without shared enforcement
