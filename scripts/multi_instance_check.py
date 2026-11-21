@@ -48,7 +48,7 @@ BREAKER_MODEL, BREAKER_PROVIDER = "gemma-4-31b", "gemini"
 def compose(*args: str, check: bool = True) -> str:
     command = ["docker", "compose", "-p", PROJECT, "-f", str(ROOT / "docker-compose.yml"),
                "-f", str(WORK / "compose.override.yml"), "--profile", "proxy", *args]
-    result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
+    result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, encoding="utf-8", errors="replace")
     if check and result.returncode != 0:
         raise RuntimeError(f"docker compose {' '.join(args)} failed:\n{result.stdout}\n{result.stderr}")
     return result.stdout.strip()
