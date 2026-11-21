@@ -575,16 +575,28 @@ Run the full production stack with two gateway replicas sharing PostgreSQL and R
 # Validate Docker Compose configuration
 docker compose config
 
-# Start all services with fake providers for evaluation
-GATEWAY_FAKE_PROVIDERS=1 docker compose up -d
+# Start all services (put GATEWAY_FAKE_PROVIDERS=1 in .env to run without provider keys)
+docker compose up -d
+
+# Also start the nginx load balancer on port 80 in front of both replicas
+docker compose --profile proxy up -d
 ```
 Services provided:
-- `postgres`: PostgreSQL 16 on `127.0.0.1:5432` with persistent volume `postgres-data`.
-- `redis`: Redis 7 on `127.0.0.1:6379` with `noeviction` policy.
+- `postgres`: PostgreSQL 16 on `127.0.0.1:54320` (container port 5432) with persistent volume `postgres-data`.
+- `redis`: Redis 7 on `127.0.0.1:63790` (container port 6379) with `noeviction` policy.
 - `migrations`: One-shot container that upgrades schema to `head` before gateways start.
 - `gateway`: Primary gateway replica on port `8000`.
 - `gateway-replica`: Second gateway replica on port `8001`.
 - `dashboard`: Streamlit dashboard on `127.0.0.1:8501`.
+- `proxy` (profile `proxy`): nginx on port 80, round-robin over both replicas, response buffering off for SSE.
+
+**Two-replica validation.** `python scripts/multi_instance_check.py` builds the image, starts this stack under its
+own Compose project (`llmgw-mi`) with fake providers, and checks that both replicas share one daily budget, one
+Redis rate limit, provider cooldowns and circuit breakers; that SSE streams through the proxy; that a restarted
+replica comes back with the shared state; and that PostgreSQL connections stay bounded. It prints a JSON report,
+exits 1 on any failure and removes the stack and its volumes afterwards (`--keep` leaves it running). Its test
+config is the shipped one with tiny budgets, one rate-limited model and `GATEWAY_FAKE_PACING=1`, which makes fake
+providers honour rate limits (they ignore them otherwise).
 
 ### 7. Health and Readiness Endpoints
 - `GET /health`: Liveness probe. Returns HTTP 200 with service version, routing config, and state backend health (`"ok"` or `"degraded"`).
