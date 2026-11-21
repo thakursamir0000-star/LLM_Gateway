@@ -1,0 +1,261 @@
+{
+  "started_at": "2026-11-21T19:46:56+00:00",
+  "plan": {
+    "requests": [
+      {
+        "name": "groq_interactive",
+        "latency_class": "interactive",
+        "stream": false,
+        "may_call": [
+          "gpt-oss-120b"
+        ],
+        "worst_case_usd": 0.000165
+      },
+      {
+        "name": "openrouter_batch",
+        "latency_class": "batch",
+        "stream": false,
+        "may_call": [
+          "or-gpt-oss-120b"
+        ],
+        "worst_case_usd": 4.6e-05
+      },
+      {
+        "name": "forced_fallback",
+        "latency_class": "interactive",
+        "stream": false,
+        "may_call": [
+          "gpt-oss-120b",
+          "or-gpt-oss-120b"
+        ],
+        "worst_case_usd": 0.000212
+      },
+      {
+        "name": "groq_streaming",
+        "latency_class": "interactive",
+        "stream": true,
+        "may_call": [
+          "gpt-oss-120b"
+        ],
+        "worst_case_usd": 0.000165
+      }
+    ],
+    "worst_case_total_usd": 0.000589,
+    "cap_usd": 0.01,
+    "max_tokens": 256,
+    "keys_present": {
+      "groq": true,
+      "openrouter": true
+    }
+  },
+  "results": {
+    "groq_interactive": {
+      "http_status": 200,
+      "shape_ok": true,
+      "answer": "Because shorter (blue) wavelengths of sunlight scatter more efficiently off air molecules than longer (red) wavelengths,",
+      "finish_reason": "stop",
+      "provider_model": "openai/gpt-oss-120b",
+      "usage": {
+        "prompt_tokens": 82,
+        "completion_tokens": 43,
+        "total_tokens": 125
+      },
+      "gateway_model": "gpt-oss-120b",
+      "tier": "strong",
+      "fallback": false,
+      "cost_usd": 3.81e-05,
+      "client_latency_s": 0.837,
+      "error": null
+    },
+    "openrouter_batch": {
+      "http_status": 200,
+      "shape_ok": true,
+      "answer": "Because molecules in the atmosphere scatter shorter (blue) wavelengths of sunlight more efficiently than longer (red) wa",
+      "finish_reason": "stop",
+      "provider_model": "openai/gpt-oss-120b",
+      "usage": {
+        "prompt_tokens": 65,
+        "completion_tokens": 43,
+        "total_tokens": 108
+      },
+      "gateway_model": "or-gpt-oss-120b",
+      "tier": "strong",
+      "fallback": false,
+      "cost_usd": 8.53e-06,
+      "client_latency_s": 3.245,
+      "error": null
+    },
+    "forced_fallback": {
+      "http_status": 200,
+      "shape_ok": true,
+      "answer": "Because molecules in the atmosphere scatter shorter (blue) wavelengths of sunlight more efficiently than longer (red) wa",
+      "finish_reason": "stop",
+      "provider_model": "openai/gpt-oss-120b",
+      "usage": {
+        "prompt_tokens": 65,
+        "completion_tokens": 43,
+        "total_tokens": 108
+      },
+      "gateway_model": "or-gpt-oss-120b",
+      "tier": "strong",
+      "fallback": true,
+      "cost_usd": 8.53e-06,
+      "client_latency_s": 2.248,
+      "error": null
+    },
+    "groq_streaming": {
+      "http_status": 200,
+      "content_type": "text/event-stream; charset=utf-8",
+      "shape_ok": true,
+      "chunks": 30,
+      "ends_with_done": true,
+      "answer": "Because molecules in the atmosphere scatter shorter (blue) wavelengths of sunlight more than longer (red) wavelengths.",
+      "usage": {
+        "prompt_tokens": 82,
+        "completion_tokens": 36,
+        "total_tokens": 118
+      },
+      "gateway_model": "gpt-oss-120b",
+      "cost_usd": 3.39e-05,
+      "time_to_first_chunk_s": 0.743,
+      "client_latency_s": 0.743
+    }
+  },
+  "spent_usd": 8.906e-05,
+  "logged_requests": [
+    {
+      "id": "chatcmpl-0ceaba5bf66e4e22957a410b",
+      "latency_class": "interactive",
+      "tier": "strong",
+      "model": "gpt-oss-120b",
+      "provider_model": "openai/gpt-oss-120b",
+      "fallback": 0,
+      "status": "ok",
+      "http_status": 200,
+      "error_type": null,
+      "prompt_tokens": 82,
+      "completion_tokens": 43,
+      "cost_usd": 3.8100000000000005e-05,
+      "latency_ms": 811.86,
+      "stream": 0
+    },
+    {
+      "id": "chatcmpl-4ef6ca10c5904770abe6a222",
+      "latency_class": "batch",
+      "tier": "strong",
+      "model": "or-gpt-oss-120b",
+      "provider_model": "openai/gpt-oss-120b",
+      "fallback": 0,
+      "status": "ok",
+      "http_status": 200,
+      "error_type": null,
+      "prompt_tokens": 65,
+      "completion_tokens": 43,
+      "cost_usd": 8.531e-06,
+      "latency_ms": 3234.33,
+      "stream": 0
+    },
+    {
+      "id": "chatcmpl-b928bcd17d554f9c91d3d2a2",
+      "latency_class": "interactive",
+      "tier": "strong",
+      "model": "or-gpt-oss-120b",
+      "provider_model": "openai/gpt-oss-120b",
+      "fallback": 1,
+      "status": "ok",
+      "http_status": 200,
+      "error_type": null,
+      "prompt_tokens": 65,
+      "completion_tokens": 43,
+      "cost_usd": 8.531e-06,
+      "latency_ms": 2233.55,
+      "stream": 0
+    },
+    {
+      "id": "chatcmpl-aaec01594d9b4794ab9fe4fd",
+      "latency_class": "interactive",
+      "tier": "strong",
+      "model": "gpt-oss-120b",
+      "provider_model": "openai/gpt-oss-120b",
+      "fallback": 0,
+      "status": "ok",
+      "http_status": 200,
+      "error_type": null,
+      "prompt_tokens": 82,
+      "completion_tokens": 36,
+      "cost_usd": 3.39e-05,
+      "latency_ms": 735.23,
+      "stream": 1
+    }
+  ],
+  "logged_calls": [
+    {
+      "request_id": "chatcmpl-0ceaba5bf66e4e22957a410b",
+      "seq": 1,
+      "model": "gpt-oss-120b",
+      "status": "ok",
+      "error_type": null,
+      "prompt_tokens": 82,
+      "completion_tokens": 43,
+      "cost_usd": 3.8100000000000005e-05,
+      "latency_ms": 787.81
+    },
+    {
+      "request_id": "chatcmpl-4ef6ca10c5904770abe6a222",
+      "seq": 1,
+      "model": "or-gpt-oss-120b",
+      "status": "ok",
+      "error_type": null,
+      "prompt_tokens": 65,
+      "completion_tokens": 43,
+      "cost_usd": 8.531e-06,
+      "latency_ms": 3227.34
+    },
+    {
+      "request_id": "chatcmpl-b928bcd17d554f9c91d3d2a2",
+      "seq": 1,
+      "model": "gpt-oss-120b",
+      "status": "error",
+      "error_type": "auth",
+      "prompt_tokens": 0,
+      "completion_tokens": 0,
+      "cost_usd": 0.0,
+      "latency_ms": 270.84
+    },
+    {
+      "request_id": "chatcmpl-b928bcd17d554f9c91d3d2a2",
+      "seq": 2,
+      "model": "or-gpt-oss-120b",
+      "status": "ok",
+      "error_type": null,
+      "prompt_tokens": 65,
+      "completion_tokens": 43,
+      "cost_usd": 8.531e-06,
+      "latency_ms": 1954.46
+    },
+    {
+      "request_id": "chatcmpl-aaec01594d9b4794ab9fe4fd",
+      "seq": 1,
+      "model": "gpt-oss-120b",
+      "status": "ok",
+      "error_type": null,
+      "prompt_tokens": 82,
+      "completion_tokens": 36,
+      "cost_usd": 3.39e-05,
+      "latency_ms": 636.97
+    }
+  ],
+  "reservations_left": 0,
+  "checks": {
+    "groq interactive answered by Groq": true,
+    "openrouter batch answered by OpenRouter": true,
+    "forced fallback reached OpenRouter": true,
+    "streaming delivered chunks and [DONE]": true,
+    "OpenAI response shape": true,
+    "every request logged once": true,
+    "failed Groq call logged for the fallback": true,
+    "no budget reservation left": true,
+    "spend within the cap": true
+  },
+  "passed": true
+}

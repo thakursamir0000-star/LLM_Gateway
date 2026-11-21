@@ -23,18 +23,19 @@ print(reply.choices[0].message.content)
 
 **Status:** Phases 1–3 (gateway, routing, monitoring, releases, security, streaming, circuit breakers, PostgreSQL,
 Redis, Alembic, multiple replicas) are built and tested with fake providers and mocked HTTP. Phase 4 (verification) is
-in progress: PostgreSQL 16 integration tests, Redis outage drills and a two-replica Docker validation pass; requests
-through the gateway to **real providers have not been verified yet**, and nothing is deployed. See
-[Validation status](#validation-status).
+in progress: PostgreSQL 16 integration tests, Redis outage drills and a two-replica Docker validation pass, and a
+real-provider smoke test through the gateway's HTTP API passed on 2026-11-22 (Groq, OpenRouter, a forced fallback and
+streaming; $0.000089; [`results/real_provider_smoke.json`](results/real_provider_smoke.json)). Nothing is deployed.
+See [Validation status](#validation-status).
 
 ## Validation status
 
 | Capability | Implemented | Unit tested | Integration tested | Real-provider tested | Deployed |
 |---|---|---|---|---|---|
-| OpenAI-compatible chat API (JSON and SSE streaming) | yes | yes | yes: two replicas in Docker, SSE through nginx (fake providers) | **no** | no |
-| Groq and OpenRouter adapters | yes | yes (mocked HTTP) | – | partly: the router lab's 3,155 real answers went through the same model registry, not the HTTP API | no |
+| OpenAI-compatible chat API (JSON and SSE streaming) | yes | yes | yes: two replicas in Docker, SSE through nginx (fake providers) | yes: smoke test, JSON and streaming (one run each) | no |
+| Groq and OpenRouter adapters | yes | yes (mocked HTTP) | – | yes: smoke test through the HTTP API, plus the router lab's 3,155 answers through the model registry | no |
 | Gemini API adapter | yes | yes (mocked HTTP) | – | no | no |
-| Retries, fallback, quota cooldowns, circuit breakers | yes | yes | yes: shared across two replicas through Redis | no | no |
+| Retries, fallback, quota cooldowns, circuit breakers | yes | yes | yes: shared across two replicas through Redis | fallback only: Groq 401 → OpenRouter in the smoke test | no |
 | Rules router, cascade | yes | yes | – | no | no |
 | Trained classifier router | yes, **not active** | yes | offline held-out evaluation | on real benchmark answers, offline | no |
 | Per-app budgets with atomic reservations | yes | yes | yes: PostgreSQL 16, two replicas | no | no |
@@ -738,8 +739,8 @@ Not met by the repository alone: provide them before exposing the gateway.
 
 ## Limitations and next steps
 
-- Requests through the gateway's HTTP API to real providers have not been verified yet; every gateway test uses fake
-  providers or mocked HTTP.
+- Real providers through the gateway's HTTP API are verified by one smoke run (`scripts/real_provider_smoke.py`, four
+  requests); the test suite itself uses fake providers or mocked HTTP. Gemini has not been called for real.
 - Nothing is deployed. There is no HTTPS entry point, no Prometheus metrics, no per-client rate limit (only daily
   budgets) and no automated backup or retention.
 - Redis is used through a synchronous client, so each Redis call briefly blocks the event loop.
