@@ -44,6 +44,7 @@ See [Validation status](#validation-status).
 | PostgreSQL storage and Alembic migrations | yes | – | yes: 25 tests on PostgreSQL 16 in CI | – | no |
 | Redis shared state and outage policy | yes | yes | yes: real Redis 7, outage drill | – | no |
 | Authentication, admin key, body limits, CORS, generic upstream errors | yes | yes | yes: 401 without a key in the Docker smoke test | – | no |
+| Locked, hash-checked dependencies; digest-pinned base image; vulnerability audit | yes | – | yes: CI installs the locks, audit workflow on every push and weekly | – | – |
 | Prometheus metrics, HTTPS entry point, per-client rate limits, backups | **no** | – | – | – | – |
 
 "Integration tested" means against real PostgreSQL, Redis or Docker Compose (`tests/test_postgres_integration.py`,
@@ -132,7 +133,7 @@ source .venv/bin/activate     # Windows: .venv\Scripts\activate
 ```
 
 ```bash
-pip install -r requirements-dev.txt
+pip install -r requirements-dev.lock   # exact, hash-checked versions (see SECURITY.md)
 ```
 
 **Without API keys** (fake models, nothing leaves your machine; anonymous access so the demo script's `X-App-Id`
@@ -570,7 +571,7 @@ For local development, SQLite remains supported by default without external depe
 ```bash
 python -m venv .venv
 source .venv/bin/activate  # Windows: .venv\Scripts\activate
-pip install -r requirements-dev.txt
+pip install -r requirements-dev.lock   # exact, hash-checked versions (see SECURITY.md)
 pytest
 python -m gateway
 ```

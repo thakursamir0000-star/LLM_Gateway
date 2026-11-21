@@ -41,8 +41,9 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
           cache: pip
-      - name: Install dependencies
-        run: pip install -r requirements-dev.txt
+          cache-dependency-path: requirements-dev.lock
+      - name: Install dependencies (exact versions and hashes from the lock)
+        run: pip install --require-hashes -r requirements-dev.lock
       - name: Lint
         run: ruff check .
       - name: PostgreSQL 16 integration tests

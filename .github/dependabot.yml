@@ -1,0 +1,15 @@
+# Python dependencies are locked with uv (requirements*.lock), which Dependabot doesn't regenerate: the weekly
+# dependency-audit workflow flags vulnerable pins instead, and SECURITY.md describes refreshing the locks.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
