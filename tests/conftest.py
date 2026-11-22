@@ -62,3 +62,21 @@ def make_config(**overrides: Any) -> GatewayConfig:
 @pytest.fixture
 def config() -> GatewayConfig:
     return make_config()
+
+
+# A developer's shell may still hold the variables the README's local demo exports. Tests that load the shipped
+# config would then pick them up (e.g. GATEWAY_API_KEYS turning anonymous test requests into 401s), so they are
+# cleared for every test; a test that needs one sets it itself. GATEWAY_DATABASE_URL and GATEWAY_REDIS_URL are kept:
+# CI sets them on purpose to point the suite at its PostgreSQL and Redis services.
+_DEVELOPER_SETTINGS = (
+    "GATEWAY_API_KEYS", "GATEWAY_API_KEYS_FILE", "GATEWAY_ADMIN_KEY", "GATEWAY_ALLOW_ANONYMOUS", "GATEWAY_ENV",
+    "GATEWAY_FAKE_PROVIDERS", "GATEWAY_FAKE_PACING", "GATEWAY_EXPOSE_METADATA", "GATEWAY_METRICS_TOKEN",
+    "GATEWAY_CONFIG", "GATEWAY_DB", "GATEWAY_STATE_BACKEND", "GATEWAY_REDIS_OUTAGE_POLICY", "GATEWAY_REPLICAS",
+    "GATEWAY_MAX_BODY_BYTES", "GATEWAY_CORS_ORIGINS", "GATEWAY_LOG_FORMAT",
+)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_from_developer_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in _DEVELOPER_SETTINGS:
+        monkeypatch.delenv(name, raising=False)

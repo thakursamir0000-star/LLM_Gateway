@@ -124,7 +124,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (tier) (rate(gateway_requests_total[5m]))",
+          "expr": "sum by (tier) (rate(gateway_requests_total{tier!=\"\"}[5m]))",
           "legendFormat": "{{tier}}"
         }
       ]

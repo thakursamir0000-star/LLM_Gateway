@@ -19,6 +19,7 @@ sys.path.insert(0, str(ROOT))
 import altair as alt
 import pandas as pd
 import streamlit as st
+from sqlalchemy.engine import make_url
 
 from gateway.config import database_target, load_config, resolve_path
 from gateway.manage.budgets import BudgetPolicy
@@ -56,7 +57,9 @@ with st.sidebar:
     apps = metrics.app_ids(store)
     app_choice = st.selectbox("App", ["All apps", *apps])
     st.button("Refresh")
-    st.caption(f"Database: `{db_path}`")
+    # Never show the database password (a URL's credentials) to dashboard viewers.
+    shown = db_path if is_sqlite else make_url(target_str).render_as_string(hide_password=True)
+    st.caption(f"Database: `{shown}`")
 
 now = utc_now()
 span = RANGES[range_name]
