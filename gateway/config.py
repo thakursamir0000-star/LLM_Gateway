@@ -145,6 +145,27 @@ class BudgetConfig(_Strict):
     reservation_ttl_s: float = Field(900.0, gt=0)
 
 
+class ClientLimit(_Strict):
+    rpm: int = Field(0, ge=0)  # requests per minute per client (0 = no limit)
+    concurrency: int = Field(0, ge=0)  # requests in flight at once per client (0 = no limit)
+
+
+class ClientLimitsConfig(_Strict):
+    """Per-client request limits, enforced across replicas through the state backend (Redis).
+
+    A client is the app its validated API key names (or its X-App-Id when anonymous access is enabled). Daily
+    USD budgets are separate (``budgets``). A request in flight holds a lease that expires after ``lease_s``, so
+    a crashed replica can't hold a client's concurrency slots forever.
+    """
+
+    default: ClientLimit = Field(default_factory=ClientLimit)
+    apps: dict[str, ClientLimit] = {}
+    lease_s: float = Field(600.0, gt=0)
+
+    def for_app(self, app_id: str) -> ClientLimit:
+        return self.apps.get(app_id, self.default)
+
+
 class AlertConfig(_Strict):
     error_rate: float = Field(0.2, ge=0, le=1)
     window_minutes: int = Field(15, ge=1)
@@ -203,6 +224,7 @@ class GatewayConfig(_Strict):
     retries: RetryConfig = Field(default_factory=RetryConfig)
     circuit_breaker: CircuitBreakerConfig = Field(default_factory=CircuitBreakerConfig)
     budgets: BudgetConfig = Field(default_factory=BudgetConfig)
+    client_limits: ClientLimitsConfig = Field(default_factory=ClientLimitsConfig)
     alerts: AlertConfig = Field(default_factory=AlertConfig)
     auth: AuthConfig = Field(default_factory=AuthConfig)
     security: SecurityConfig = Field(default_factory=SecurityConfig)

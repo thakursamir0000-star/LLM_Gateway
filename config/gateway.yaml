@@ -167,6 +167,16 @@ budgets:
   apps:
     demo: {daily_usd: 0.20}
 
+# ── Per-client request limits ───────────────────────────────────────
+# Requests per minute and requests in flight per client (the app its API key names), shared by every replica
+# through Redis. 0 = no limit. Refusals answer 429 client_rate_limited with Retry-After; they are separate from
+# the daily budgets above and from the per-model provider limits.
+client_limits:
+  default: {rpm: 600, concurrency: 50}
+  lease_s: 600                  # a request in flight holds its slot at most this long (crash safety)
+  apps:
+    demo: {rpm: 60, concurrency: 5}
+
 # ── Alerts ──────────────────────────────────────────────────────────
 # Checked at most every check_interval_s; logged, stored, and POSTed as JSON
 # to the URL in $ALERT_WEBHOOK_URL when it is set.

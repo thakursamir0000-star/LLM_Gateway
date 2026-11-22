@@ -211,7 +211,9 @@ class Gateway:
         now = self.clock()
         record = RequestRecord(id=ctx.request_id, ts=iso(now), app_id=ctx.app_id, requested_model=request.model,
                                stream=request.stream)
+        lease: str | None = None
         try:
+            lease = await self._admit_client(ctx.app_id)
             result = await self._run(request, ctx, record, now)
             record.status, record.http_status = "ok", 200
             return result
@@ -232,6 +234,7 @@ class Gateway:
             self._fail(record, error, detail=f"{type(e).__name__}: {e}")
             raise error from e
         finally:
+            await self._release_client(ctx.app_id, lease)
             await self._finish(record, started)  # also settles the request's budget reservation
 
     async def stream(
@@ -247,16 +250,20 @@ class Gateway:
         now = self.clock()
         record = RequestRecord(id=ctx.request_id, ts=iso(now), app_id=ctx.app_id, requested_model=request.model,
                                stream=True)
+        lease: str | None = None
         try:
-            return await self._open_stream(request, ctx, record, now, started, expose_metadata)
+            lease = await self._admit_client(ctx.app_id)
+            events, headers = await self._open_stream(request, ctx, record, now, started, expose_metadata)
         except GatewayError as e:
             if record.http_status is None:  # not recorded yet by the provider-failure paths
                 self._fail(record, e)
+            await self._release_client(ctx.app_id, lease)
             await self._finish(record, started)
             raise
         except ProviderError as e:
             error = from_provider_error(e)
             self._fail(record, error, detail=upstream_detail(record.id, e))
+            await self._release_client(ctx.app_id, lease)
             await self._finish(record, started)
             raise error from e
         except asyncio.CancelledError:
@@ -264,14 +271,61 @@ class Gateway:
             record.error_message = "client disconnected or request cancelled before the first chunk"
             if record.calls and record.calls[-1].status == "ok" and record.calls[-1].latency_ms is None:
                 record.calls[-1].status, record.calls[-1].error_type = "error", "cancelled"
+            await self._release_client(ctx.app_id, lease)
             await self._finish(record, started)
             raise
         except Exception as e:
             log.exception("streaming request %s failed", ctx.request_id)
             error = GatewayError(500, "internal gateway error", type_="server_error", code="internal_error")
             self._fail(record, error, detail=f"{type(e).__name__}: {e}")
+            await self._release_client(ctx.app_id, lease)
             await self._finish(record, started)
             raise error from e
+        if lease is None:
+            return events, headers
+        return self._holding_lease(events, ctx.app_id, lease), headers
+
+    async def _holding_lease(self, events: AsyncIterator[str], app_id: str, lease: str) -> AsyncIterator[str]:
+        """Pass a started stream's events through, holding the client's concurrency slot until it ends
+        (finished, failed or abandoned by a disconnected client)."""
+        try:
+            async for event in events:
+                yield event
+        finally:
+            try:
+                aclose = getattr(events, "aclose", None)
+                if aclose is not None:
+                    await aclose()
+            finally:
+                await self._release_client(app_id, lease)
+
+    async def _admit_client(self, app_id: str) -> str | None:
+        """Admit one request of ``app_id`` under its per-client limits (config ``client_limits``), shared by
+        every replica through the state backend. Returns a lease to release when the request ends, or None
+        when the client has no limits. Raises 429 ``client_rate_limited`` (with Retry-After) when refused."""
+        limit = self.config.client_limits.for_app(app_id)
+        if limit.rpm == 0 and limit.concurrency == 0:
+            return None
+        admission = await asyncio.to_thread(self.registry.state.admit_client, app_id, limit.rpm,
+                                            limit.concurrency, self.config.client_limits.lease_s)
+        if not admission.admitted:
+            if admission.reason == "state_unavailable":
+                message = "request limits can't be checked right now (shared state unavailable); retry shortly"
+            elif admission.reason == "concurrency":
+                message = f"too many requests in progress for app {app_id!r} (limit {limit.concurrency})"
+            else:
+                message = f"request rate limit for app {app_id!r} reached ({limit.rpm} per minute)"
+            raise GatewayError(429, message, type_="rate_limit_error", code="client_rate_limited",
+                               retry_after=max(1.0, admission.retry_after), counts_as_error=False)
+        return admission.lease_id
+
+    async def _release_client(self, app_id: str, lease: str | None) -> None:
+        if lease is None:
+            return
+        try:
+            await asyncio.to_thread(self.registry.state.release_client, app_id, lease)
+        except Exception:  # an unreleased lease expires after client_limits.lease_s
+            log.exception("could not release the concurrency lease of app %s", app_id)
 
     async def _open_stream(self, request: ChatRequest, ctx: RequestContext, record: RequestRecord, now: datetime,
                            started: float, expose_metadata: bool) -> tuple[AsyncIterator[str], dict[str, str]]:

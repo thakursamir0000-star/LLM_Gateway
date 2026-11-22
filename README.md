@@ -46,7 +46,8 @@ See [Validation status](#validation-status).
 | Authentication, admin key, body limits, CORS, generic upstream errors | yes | yes | yes: 401 without a key in the Docker smoke test | – | no |
 | Locked, hash-checked dependencies; digest-pinned base image; vulnerability audit | yes | – | yes: CI installs the locks, audit workflow on every push and weekly | – | – |
 | HTTPS proxy (TLS 1.2/1.3, redirect, security headers), dashboard password, admin API not published | yes | yes (password hashing) | yes: two-replica Docker check | – | no |
-| Prometheus metrics, per-client rate limits, backups | **no** | – | – | – | – |
+| Per-client request limits (requests per minute, requests in flight) | yes | yes | yes: real Redis 7, two backends sharing one allowance | – | no |
+| Prometheus metrics, backups | **no** | – | – | – | – |
 
 "Integration tested" means against real PostgreSQL, Redis or Docker Compose (`tests/test_postgres_integration.py`,
 `tests/test_redis_*.py`, `scripts/redis_outage_drill.py`, `scripts/multi_instance_check.py`).
@@ -381,6 +382,15 @@ Phase 1 security hardening enforces production-safe defaults:
   request records its real cost and drops its reservation in the same transaction; a reservation a crashed process
   never settled expires after `budgets.reservation_ttl_s`. A request is admitted while any budget is left, so the
   last one admitted can still overshoot by the part of its real cost its reservation didn't cover.
+- **Per-client request limits**: `client_limits.default` and `client_limits.apps.<app>` set `rpm` (requests per
+  minute) and `concurrency` (requests in flight, streams included until they end) per client; 0 means no limit. The
+  shipped config allows 600 per minute and 50 at once (`demo`: 60 and 5). The counters live in Redis, so every
+  replica shares one allowance (in-process with the memory backend). A refusal answers 429 `client_rate_limited`
+  with `Retry-After`, is logged as rejected, and calls no provider. Only validated clients are counted: an invalid or
+  revoked key gets 401 first and uses none of the allowance. A slot a crashed replica never released expires after
+  `client_limits.lease_s`. While Redis is down the outage policy applies (`fail_closed`: 429; `local_share`: each
+  replica allows `limit // replicas`). Token-per-minute limits per client are not implemented; daily USD budgets
+  cap spend.
 - **Feedback**: `POST /v1/feedback {"request_id": "<response id>", "score": "up" | "down" | 1 | -1, "comment": "..."}`.
 - **Alerts**: error rate over the last `window_minutes` (with at least `min_requests`) above `alerts.error_rate`, or
   today's cost above `alerts.daily_cost_usd`. Each alert is logged, stored (the dashboard shows it), and POSTed as JSON
@@ -733,6 +743,7 @@ tests/              pytest suite
 | Every request answers 401 `auth_required` | no `GATEWAY_API_KEYS` and anonymous access off: configure keys, or `GATEWAY_ALLOW_ANONYMOUS=1` for local demos |
 | `/ready` answers 503 | the database or Redis is unreachable; `/health` shows which (`state.degraded`) |
 | 429 `rate_limit_exceeded` while Redis is down | the `fail_closed` outage policy at work; restore Redis, or choose `local_share` with `GATEWAY_REPLICAS` |
+| 429 `client_rate_limited` | the client's `client_limits` (requests per minute or in flight) are reached; wait `Retry-After` seconds or raise the limit |
 | 429 `budget_exceeded` | the app's daily budget (UTC day) is spent or held by requests in progress |
 | PostgreSQL tests skip | set `TEST_POSTGRES_URL` to a test database (its name must contain "test") |
 | `psycopg` fails to import on Windows | a policy blocking native DLLs; run PostgreSQL work in Docker or WSL |
@@ -751,8 +762,7 @@ Not met by the repository alone: provide them before exposing the gateway.
 
 - Real providers through the gateway's HTTP API are verified by one smoke run (`scripts/real_provider_smoke.py`, four
   requests); the test suite itself uses fake providers or mocked HTTP. Gemini has not been called for real.
-- Nothing is deployed. There are no Prometheus metrics, no per-client rate limit (only daily
-  budgets) and no automated backup or retention.
+- Nothing is deployed. There are no Prometheus metrics and no automated backup or retention.
 - Redis is used through a synchronous client, so each Redis call briefly blocks the event loop.
 - The trained classifier is evaluated (see [Results](#results)) but not shipped: `models/router.json` is not
   committed, so `model="router"` requests use the rule-based router. On the held-out questions it saved 8% against
