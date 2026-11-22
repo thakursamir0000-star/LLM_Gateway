@@ -405,7 +405,8 @@ class RedisRateLimiter(RateLimiterProtocol):
         reservation_id = uuid.uuid4().hex
         while True:
             try:
-                res = self._backend.scripts["ratelimit_wait_and_reserve"](
+                res = await asyncio.to_thread(
+                    self._backend.scripts["ratelimit_wait_and_reserve"],
                     keys=[self._zset_key, self._items_key],
                     args=[self.rpm, self.tpm, tokens, reservation_id, "1"],
                 )
@@ -539,7 +540,13 @@ class RedisCircuitBreaker(CircuitBreakerProtocol):
 
 
 class RedisStateBackend(StateBackend):
-    """Production Redis-backed shared state backend."""
+    """Production Redis-backed shared state backend.
+
+    The client is synchronous: every call is a network round trip, so async code runs them in a worker thread
+    (``blocking``; see ModelRegistry._io and the rate limiter's acquire), never on the event loop.
+    """
+
+    blocking = True
 
     def __init__(self, config: RedisConfig):
         self.config = config

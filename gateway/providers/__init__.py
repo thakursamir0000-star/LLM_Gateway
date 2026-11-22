@@ -112,15 +112,22 @@ class ModelRegistry:
     def set_cooldown(self, alias: str, cooldown: float) -> None:
         self.state.set_cooldown(alias, cooldown)
 
+    async def _io(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        """Run a shared-state call. A network backend (Redis) blocks, so its calls run in a worker thread and
+        never stall the event loop; the in-memory backend is called directly."""
+        if getattr(self.state, "blocking", False):
+            return await asyncio.to_thread(fn, *args, **kwargs)
+        return fn(*args, **kwargs)
+
     async def complete(self, alias: str, messages: list[dict[str, Any]], params: dict[str, Any]) -> Completion:
         """Call model ``alias``; raises ProviderError after the retries run out."""
         spec = self.spec(alias)
-        left = self.cooldown_left(alias)
+        left = await self._io(self.cooldown_left, alias)
         if left > 0:
             raise ProviderError(f"{alias} skipped: quota exhausted, cooling down for {left:.0f}s",
                                 kind=QUOTA_EXHAUSTED, status=429, retry_after=left)
         breaker = self.circuit_breakers[spec.provider]
-        allowed, token = breaker.can_execute()
+        allowed, token = await self._io(breaker.can_execute)
         if not allowed:
             raise ProviderError(f"provider {spec.provider!r} circuit breaker is OPEN",
                                 kind=OVERLOADED, status=503)
@@ -136,40 +143,40 @@ class ModelRegistry:
                     reservation = await limiter.acquire(estimate, max_wait=self.max_wait, sleep=self._sleep)
                 except RateLimited as e:
                     settled = True
-                    breaker.record_neutral(token)
+                    await self._io(breaker.record_neutral, token)
                     raise ProviderError(str(e), kind=RATE_LIMIT, status=429, retry_after=e.wait_s) from e
                 except BaseException:
                     settled = True
-                    breaker.record_neutral(token)
+                    await self._io(breaker.record_neutral, token)
                     raise
                 started = time.perf_counter()
                 try:
                     completion = await provider.complete(spec.model, messages, merged)
                     completion.latency_ms = round((time.perf_counter() - started) * 1000, 1)
                     settled = True
-                    breaker.record_success(token)
-                    limiter.settle(reservation, completion.prompt_tokens + completion.completion_tokens)
+                    await self._io(breaker.record_success, token)
+                    await self._io(limiter.settle, reservation, completion.prompt_tokens + completion.completion_tokens)
                     return completion
                 except BaseException as e:
-                    limiter.settle(reservation, 0)
+                    await self._io(limiter.settle, reservation, 0)
                     if isinstance(e, ProviderError) and e.kind == QUOTA_EXHAUSTED:
                         cooldown = max(self.config.retries.quota_cooldown_s, e.retry_after or 0.0)
-                        self.set_cooldown(alias, cooldown)
+                        await self._io(self.set_cooldown, alias, cooldown)
                     if not isinstance(e, ProviderError) or e.kind not in RETRYABLE or attempt == self.attempts:
                         settled = True
-                        breaker.record_failure(token, is_qualifying=is_qualifying_failure(e))
+                        await self._io(breaker.record_failure, token, is_qualifying=is_qualifying_failure(e))
                         raise
                     wait = max(e.retry_after or 0.0, float(2 ** (attempt - 1)))
                     if wait > self.max_wait:
                         settled = True
-                        breaker.record_failure(token, is_qualifying=is_qualifying_failure(e))
+                        await self._io(breaker.record_failure, token, is_qualifying=is_qualifying_failure(e))
                         raise
                     await self._sleep(wait)
                     continue
             raise AssertionError("unreachable")  # pragma: no cover
         finally:
             if not settled:
-                breaker.record_neutral(token)
+                await self._io(breaker.record_neutral, token)
 
     async def stream(self, alias: str, messages: list[dict[str, Any]], params: dict[str, Any]) -> AsyncIterator[StreamChunk]:
         """Stream model ``alias``; raises ProviderError on failure.
@@ -179,12 +186,12 @@ class ModelRegistry:
         retried. All retries of one call count as at most one breaker failure.
         """
         spec = self.spec(alias)
-        left = self.cooldown_left(alias)
+        left = await self._io(self.cooldown_left, alias)
         if left > 0:
             raise ProviderError(f"{alias} skipped: quota exhausted, cooling down for {left:.0f}s",
                                 kind=QUOTA_EXHAUSTED, status=429, retry_after=left)
         breaker = self.circuit_breakers[spec.provider]
-        allowed, token = breaker.can_execute()
+        allowed, token = await self._io(breaker.can_execute)
         if not allowed:
             raise ProviderError(f"provider {spec.provider!r} circuit breaker is OPEN",
                                 kind=OVERLOADED, status=503)
@@ -200,11 +207,11 @@ class ModelRegistry:
                     reservation = await limiter.acquire(estimate, max_wait=self.max_wait, sleep=self._sleep)
                 except RateLimited as e:
                     settled = True
-                    breaker.record_neutral(token)
+                    await self._io(breaker.record_neutral, token)
                     raise ProviderError(str(e), kind=RATE_LIMIT, status=429, retry_after=e.wait_s) from e
                 except BaseException:
                     settled = True
-                    breaker.record_neutral(token)
+                    await self._io(breaker.record_neutral, token)
                     raise
 
                 upstream_gen = provider.stream(spec.model, messages, merged)
@@ -225,34 +232,34 @@ class ModelRegistry:
                     except BaseException as e:
                         if isinstance(e, ProviderError) and e.kind == QUOTA_EXHAUSTED:
                             cooldown = max(self.config.retries.quota_cooldown_s, e.retry_after or 0.0)
-                            self.set_cooldown(alias, cooldown)
+                            await self._io(self.set_cooldown, alias, cooldown)
                         retry_after = e.retry_after if isinstance(e, ProviderError) else None
                         retryable = ((isinstance(e, ProviderError) and e.kind in RETRYABLE)
                                      or isinstance(e, httpx.TransportError))
                         if first_chunk_yielded or not retryable or attempt == self.attempts:
                             settled = True
-                            breaker.record_failure(token, is_qualifying=is_qualifying_failure(e))
+                            await self._io(breaker.record_failure, token, is_qualifying=is_qualifying_failure(e))
                             raise
                         wait = max(retry_after or 0.0, float(2 ** (attempt - 1)))
                         if wait > self.max_wait:
                             settled = True
-                            breaker.record_failure(token, is_qualifying=is_qualifying_failure(e))
+                            await self._io(breaker.record_failure, token, is_qualifying=is_qualifying_failure(e))
                             raise
                         await self._sleep(wait)
                         continue
                     else:
                         settled = True
-                        breaker.record_success(token)
+                        await self._io(breaker.record_success, token)
                         return
                 finally:
-                    limiter.settle(reservation, stream_tokens(chars, streamed_chars, usage_prompt, usage_completion,
-                                                              first_chunk_yielded))
+                    await self._io(limiter.settle, reservation, stream_tokens(chars, streamed_chars, usage_prompt,
+                                                                           usage_completion, first_chunk_yielded))
                     await upstream_gen.aclose()
         finally:
             if not settled:
-                breaker.record_neutral(token)
+                await self._io(breaker.record_neutral, token)
 
     async def aclose(self) -> None:
         for provider in self.providers.values():
             await provider.aclose()
-        self.state.close()
+        await self._io(self.state.close)

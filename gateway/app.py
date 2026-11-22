@@ -274,7 +274,7 @@ def create_app(config: GatewayConfig | None = None, *, providers: dict[str, Prov
     @app.get("/health")
     async def health() -> dict[str, Any]:
         state = await asyncio.to_thread(releases.state)
-        state_status = registry.state.status() if hasattr(registry, "state") else {"backend": "memory", "ready": True}
+        state_status = await asyncio.to_thread(registry.state.status) if hasattr(registry, "state") else {"backend": "memory", "ready": True}
         is_healthy = state_status.get("ready", True) and not state_status.get("degraded", False)
         return {
             "status": "ok" if is_healthy else "degraded",
@@ -304,14 +304,15 @@ def create_app(config: GatewayConfig | None = None, *, providers: dict[str, Prov
         # Check state backend (Redis)
         state_ok, state_reason = True, "ok"
         if hasattr(registry, "state"):
-            state_ok, state_reason = registry.state.is_ready()
+            state_ok, state_reason = await asyncio.to_thread(registry.state.is_ready)
 
         is_ready = db_ok and state_ok
         status_code = 200 if is_ready else 503
         data = {
             "status": "ready" if is_ready else "not_ready",
             "database": {"ok": db_ok, "detail": db_reason},
-            "state_backend": registry.state.status() if hasattr(registry, "state") else {"backend": "memory", "ready": True},
+            "state_backend": (await asyncio.to_thread(registry.state.status) if hasattr(registry, "state")
+                              else {"backend": "memory", "ready": True}),
         }
         return JSONResponse(data, status_code=status_code)
 

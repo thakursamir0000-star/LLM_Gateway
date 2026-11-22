@@ -763,7 +763,8 @@ Not met by the repository alone: provide them before exposing the gateway.
 - Real providers through the gateway's HTTP API are verified by one smoke run (`scripts/real_provider_smoke.py`, four
   requests); the test suite itself uses fake providers or mocked HTTP. Gemini has not been called for real.
 - Nothing is deployed. There are no Prometheus metrics and no automated backup or retention.
-- Redis is used through a synchronous client, so each Redis call briefly blocks the event loop.
+- Redis is used through a synchronous client whose calls run in worker threads (never on the event loop); each
+  call still holds a thread for one round trip, which bounds Redis throughput by the thread pool.
 - The trained classifier is evaluated (see [Results](#results)) but not shipped: `models/router.json` is not
   committed, so `model="router"` requests use the rule-based router. On the held-out questions it saved 8% against
   always-strong with no significant accuracy difference, on benchmark questions only.
