@@ -48,7 +48,7 @@ See [Validation status](#validation-status).
 | HTTPS proxy (TLS 1.2/1.3, redirect, security headers), dashboard password, admin API not published | yes | yes (password hashing) | yes: two-replica Docker check | – | no |
 | Per-client request limits (requests per minute, requests in flight) | yes | yes | yes: real Redis 7, two backends sharing one allowance | – | no |
 | Prometheus metrics, JSON access logs, Grafana dashboard, alert rules | yes | yes | – | – | no |
-| Backups | **no** | – | – | – | – |
+| Request-log retention, backup and restore (with a restore drill) | yes | yes (SQLite) | yes: retention on PostgreSQL 16, backup drill on the Compose database | – | no |
 
 "Integration tested" means against real PostgreSQL, Redis or Docker Compose (`tests/test_postgres_integration.py`,
 `tests/test_redis_*.py`, `scripts/redis_outage_drill.py`, `scripts/multi_instance_check.py`).
@@ -414,6 +414,22 @@ Phase 1 security hardening enforces production-safe defaults:
   slow p95) and Grafana (`127.0.0.1:3000`, admin password from `GRAFANA_ADMIN_PASSWORD`, the provisioned "LLM
   Gateway" dashboard). Routing the alerts to a pager needs an Alertmanager, which is not included.
 
+## Retention, backup and restore
+
+- **Retention**: `python -m gateway.manage retention --dry-run` counts, `--yes` deletes, in one transaction,
+  requests, calls, feedback and alerts older than `storage.retention_days` (default 90, at least 2 so today's budget
+  spend stays) or `--days N`, and budget reservations that have expired. Deployments are kept as the release audit
+  trail. Run it daily (cron, a Kubernetes CronJob or `docker compose run --rm gateway python -m gateway.manage
+  retention --yes`).
+- **Backup**: `python scripts/db_backup.py backup` writes a custom-format `pg_dump` of the Compose database to
+  `var/backups/` (`--local` uses `pg_dump` on this machine with `$GATEWAY_DATABASE_URL`; SQLite uses the online
+  backup API). Backups contain app ids, costs and feedback comments: store them encrypted and off-site.
+- **Restore**: `python scripts/db_backup.py restore <archive> --target <new database> --yes` restores next to the
+  live database; overwriting the live one also needs `--overwrite-live`.
+- **Drill**: `python scripts/db_backup.py drill` backs up, restores into a scratch database, compares the row
+  count of every table and the Alembic revision, and drops the scratch database. Run it after every schema change
+  and on a schedule; it passed on the Compose PostgreSQL 16 database (5 requests, revision 0003).
+
 ## Router lab: data, training, evaluation
 
 The router is trained on which questions the cheap model gets right. The OpenRouter collection and held-out
@@ -773,14 +789,14 @@ Not met by the repository alone: provide them before exposing the gateway.
 - `GATEWAY_ENV=production` with PostgreSQL, Redis (`noeviction`), client keys and an admin key; start-up refuses less.
 - A certificate from a real CA for the nginx `proxy` (the bundled script makes self-signed development ones), and a
   strong dashboard password (`DASHBOARD_PASSWORD`).
-- Backups of PostgreSQL and a retention policy for the request log (none are automated yet).
+- Scheduled `retention --yes`, scheduled backups copied off the host (encrypted), and a periodic restore drill.
 - An Alertmanager (or another receiver) for the Prometheus alert rules, and Grafana behind your SSO or VPN.
 
 ## Limitations and next steps
 
 - Real providers through the gateway's HTTP API are verified by one smoke run (`scripts/real_provider_smoke.py`, four
   requests); the test suite itself uses fake providers or mocked HTTP. Gemini has not been called for real.
-- Nothing is deployed. There is no automated backup or retention.
+- Nothing is deployed. Retention and backups are commands to schedule; nothing schedules them yet.
 - Redis is used through a synchronous client whose calls run in worker threads (never on the event loop); each
   call still holds a thread for one round trip, which bounds Redis throughput by the thread pool.
 - The trained classifier is evaluated (see [Results](#results)) but not shipped: `models/router.json` is not

@@ -1,4 +1,4 @@
-"""Manage releases from the command line (works on the database directly).
+"""Manage releases and request-log retention from the command line (works on the database directly).
 
     python -m gateway.manage status
     python -m gateway.manage activate v2-gemma --note "promote after canary"
@@ -6,16 +6,18 @@
     python -m gateway.manage canary v2-gemma 0.1
     python -m gateway.manage canary-off
     python -m gateway.manage history
+    python -m gateway.manage retention --dry-run      # then --yes; keeps storage.retention_days
 """
 
 from __future__ import annotations
 
 import argparse
 import sys
+from datetime import timedelta
 
-from gateway.config import database_target, load_config
+from gateway.config import GatewayConfig, database_target, load_config
 from gateway.manage.releases import ReleaseError, ReleaseManager
-from gateway.monitoring.store import Store
+from gateway.monitoring.store import Store, iso, utc_now
 
 
 def describe(manager: ReleaseManager) -> str:
@@ -33,6 +35,25 @@ def describe(manager: ReleaseManager) -> str:
         lines.append("canary:  none")
     lines.append("releases: " + ", ".join(manager.config.releases))
     return "\n".join(lines)
+
+
+def run_retention(config: GatewayConfig, args: argparse.Namespace) -> int:
+    days = args.days if args.days is not None else config.storage.retention_days
+    if days < 2:
+        print("error: keep at least 2 days (today's spend counts against the budgets)", file=sys.stderr)
+        return 1
+    if not args.dry_run and not args.yes:
+        print("error: deleting rows is permanent: pass --yes (or --dry-run to count)", file=sys.stderr)
+        return 1
+    now = utc_now()
+    store = Store(database_target(config))
+    try:
+        counts = store.purge_older_than(iso(now - timedelta(days=days)), iso(now), dry_run=args.dry_run)
+    finally:
+        store.close()
+    verb = "would delete" if args.dry_run else "deleted"
+    print(f"{verb} rows older than {days} days: " + ", ".join(f"{t}={n}" for t, n in counts.items()))
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -54,9 +75,15 @@ def main(argv: list[str] | None = None) -> int:
     canary_off.add_argument("--note", default="")
     history = sub.add_parser("history", help="deployment log, newest first")
     history.add_argument("--limit", type=int, default=20)
+    retention = sub.add_parser("retention", help="delete request-log rows older than the retention period")
+    retention.add_argument("--days", type=int, help="keep this many days (default: storage.retention_days)")
+    retention.add_argument("--dry-run", action="store_true", help="count, delete nothing")
+    retention.add_argument("--yes", action="store_true", help="confirm the deletion")
     args = parser.parse_args(argv)
 
     config = load_config(args.config)
+    if args.command == "retention":
+        return run_retention(config, args)
     store = Store(
         database_target(config),
         pool_size=config.storage.pool_size,

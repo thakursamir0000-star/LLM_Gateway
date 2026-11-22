@@ -193,6 +193,8 @@ class StorageConfig(_Strict):
     max_overflow: int = Field(10, ge=0)
     pool_timeout_s: float = Field(30, gt=0)
     pool_recycle_s: int = Field(1800, ge=0)
+    # Request log retention for `python -m gateway.manage retention` (the budget needs today's rows: at least 2).
+    retention_days: int = Field(90, ge=2)
 
 
 class RedisConfig(_Strict):

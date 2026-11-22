@@ -50,7 +50,7 @@ from gateway.migrations import (
 )
 from gateway.monitoring import metrics
 from gateway.monitoring.alerts import AlertMonitor
-from gateway.monitoring.store import METADATA, REQUESTS, CallRecord, RequestRecord, Store, iso
+from gateway.monitoring.store import METADATA, REQUESTS, CallRecord, RequestRecord, Store, iso, utc_now
 from gateway.providers.base import Completion
 from gateway.providers.fake import FakeProvider
 from scripts.migrate_sqlite_to_postgres import DataMigrationError, migrate
@@ -678,3 +678,16 @@ def test_alerts_persist_filter_and_fire_once_across_instances(migrated):
     finally:
         for s in stores:
             s.close()
+
+
+def test_retention_purge_on_postgres(store):
+    now = utc_now()
+    for i, age in enumerate((0, 40, 400)):
+        ts = iso(now - timedelta(days=age))
+        store.log_request(request(f"ret{i}", ts, calls=[CallRecord(1, "cheap", "small")]))
+        store.add_feedback(f"ret{i}", "app", 1, None, ts)
+    cutoff = iso(now - timedelta(days=30))
+    assert store.purge_older_than(cutoff, iso(now), dry_run=True)["requests"] == 2
+    deleted = store.purge_older_than(cutoff, iso(now))
+    assert (deleted["requests"], deleted["calls"], deleted["feedback"]) == (2, 2, 2)
+    assert store.scalar("SELECT count(*) FROM requests") == 1

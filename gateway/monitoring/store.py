@@ -522,6 +522,33 @@ class Store:
         except DBAPIError as error:
             self._handle_dbapi(error)
 
+    # ── retention ──────────────────────────────────────────────────
+    def purge_older_than(self, cutoff: str, now: str, dry_run: bool = False) -> dict[str, int]:
+        """Delete requests, calls, feedback and alerts older than ``cutoff`` (ISO UTC) and budget reservations
+        that expired before ``now``, in one transaction; returns the rows per table. Deployments are kept (the
+        release audit trail). With ``dry_run`` nothing is deleted and the counts are what would be."""
+        self._check_open()
+        targets = {
+            "calls": CALLS.c.ts < cutoff,
+            "feedback": FEEDBACK.c.ts < cutoff,
+            "requests": REQUESTS.c.ts < cutoff,
+            "alerts": ALERTS.c.ts < cutoff,
+            "budget_reservations": BUDGET_RESERVATIONS.c.expires_at < now,
+        }
+        counts: dict[str, int] = {}
+        try:
+            with self._lock, self.engine.begin() as connection:
+                for name, condition in targets.items():
+                    table = TABLES[name]
+                    if dry_run:
+                        counts[name] = int(connection.execute(
+                            select(func.count()).select_from(table).where(condition)).scalar() or 0)
+                    else:
+                        counts[name] = int(connection.execute(delete(table).where(condition)).rowcount or 0)
+        except DBAPIError as error:
+            self._handle_dbapi(error)
+        return counts
+
     # ── budget reservations ────────────────────────────────────────
     def reserve_budget(self, request_id: str, app_id: str, day: str, limit: float, estimate: float, now: str,
                        expires_at: str) -> BudgetReservation:
