@@ -9,7 +9,8 @@ rule_files:
 scrape_configs:
   - job_name: gateway
     metrics_path: /metrics
-    # With GATEWAY_METRICS_TOKEN set on the gateway, add:
-    #   authorization: {type: Bearer, credentials_file: /etc/prometheus/metrics-token}
+    # With GATEWAY_METRICS_TOKEN set on the gateway, delete the "# " before the next line and mount the token file
+    # (docs/RUNBOOK.md, section 2 step 5); otherwise every scrape gets 401.
+    # authorization: {type: Bearer, credentials_file: /etc/prometheus/metrics-token}
     static_configs:
       - targets: ["gateway:8000", "gateway-replica:8001"]

@@ -26,7 +26,7 @@ Create on the host, readable only by the deploying user (`chmod 600`):
    GEMINI_API_KEY=<key>
    GATEWAY_API_KEYS_FILE=/run/secrets/api-keys
    GATEWAY_ADMIN_KEY=sha256:<hex of the admin key>
-   GATEWAY_METRICS_TOKEN=<random>
+   GATEWAY_METRICS_TOKEN=<random>                # optional; if set, also give it to Prometheus (step 5)
    GRAFANA_ADMIN_PASSWORD=<random>
    GATEWAY_REPLICAS=2
    ```
@@ -37,6 +37,17 @@ Create on the host, readable only by the deploying user (`chmod 600`):
    self-signed certificate: overwrite it with the real one afterwards).
 4. Change the PostgreSQL password in `docker-compose.yml` (`POSTGRES_PASSWORD` and every `GATEWAY_DATABASE_URL`) or
    point `GATEWAY_DATABASE_URL` at a managed database.
+5. The metrics token. With `GATEWAY_METRICS_TOKEN` set, every replica answers `/metrics` with 401 unless the scrape
+   sends the token, and the shipped `config/prometheus/prometheus.yml` sends none. Prometheus must get the token
+   too, or every target shows as down and `GatewayReplicaDown` fires:
+   - write the same token, with no trailing newline, to `secrets/metrics-token` (`printf '%s' '<token>' > ...`);
+   - mount it in the `prometheus` service (in the same Compose override as step 2):
+     `- ./secrets/metrics-token:/etc/prometheus/metrics-token:ro`;
+   - in `config/prometheus/prometheus.yml`, uncomment the
+     `authorization: {type: Bearer, credentials_file: /etc/prometheus/metrics-token}` line under the `gateway` job.
+
+   Without the token, `/metrics` is still not public: the proxy answers 403 for it and the gateway ports are bound
+   to loopback. In that case leave `GATEWAY_METRICS_TOKEN` out of `.env` and change nothing in Prometheus.
 
 ## 3. First deployment
 
@@ -56,7 +67,11 @@ curl -s http://127.0.0.1:8000/ready                      # database and Redis ok
 curl -s -o /dev/null -w "%{http_code}\n" https://<host>/admin/status      # 403: admin API not published
 curl -s -o /dev/null -w "%{http_code}\n" https://<host>/metrics           # 403
 curl -s -o /dev/null -w "%{http_code}\n" https://<host>/dashboard/        # 401 without the password
+curl -s http://127.0.0.1:9090/api/v1/targets | grep -o '"health":"[a-z]*"'  # "up" for both replicas
 ```
+
+A target showing `"down"` with a 401 in `lastError` means the metrics token is set on the gateway but not given to
+Prometheus (§2 step 5).
 
 Then the real-provider smoke test on the host (paid, capped at `--max-cost-usd`, default $0.01; it runs its own
 in-process gateway with the same keys): `python scripts/real_provider_smoke.py --dry-run`, then `--yes`. Finally
@@ -106,7 +121,7 @@ from step 1 into a new database (`scripts/db_backup.py restore ... --target <new
 
 - **Client key**: `python scripts/make_api_key.py <app> --append secrets/api-keys`, rolling restart, give the client
   the new key, delete the old line, rolling restart. The old key gets 401 afterwards.
-- **Admin key / metrics token / Grafana password**: change in `.env`, rolling restart (Prometheus' token file too).
+- **Admin key / metrics token / Grafana password**: change in `.env`, rolling restart. For the metrics token, update `secrets/metrics-token` at the same time (Prometheus re-reads its `credentials_file` on each scrape).
 - **Provider key**: create the new key at the provider, update `.env`, rolling restart, revoke the old key there.
 
 ## 8. Not covered yet
