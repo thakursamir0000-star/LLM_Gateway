@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import random
@@ -32,10 +33,13 @@ from typing import Any
 
 import httpx
 
+from gateway import __version__
 from gateway.config import GatewayConfig, Release
+from gateway.logs import log_access
 from gateway.manage.budgets import BudgetPolicy, reservation_estimate, seconds_until_utc_midnight
 from gateway.manage.releases import ReleaseManager
 from gateway.monitoring.alerts import AlertMonitor
+from gateway.monitoring.prometheus import Metrics
 from gateway.monitoring.store import CallRecord, RequestRecord, Store, iso, utc_now
 from gateway.providers import ModelRegistry
 from gateway.providers.base import (
@@ -59,6 +63,15 @@ log = logging.getLogger("gateway")
 # `model` values that select a routing mode (None = the configured default).
 MODE_ALIASES: dict[str, str | None] = {"auto": None, "gateway": None, "": None, "router": "router",
                                        "cascade": "cascade", "cheap": "cheap", "strong": "strong"}
+
+
+def in_share(request_id: str, share: float) -> bool:
+    """Whether ``request_id`` falls in the first ``share`` of a uniform hash space (stable per id)."""
+    if share >= 1:
+        return True
+    if share <= 0:
+        return False
+    return int(hashlib.sha256(request_id.encode()).hexdigest()[:8], 16) / 0x100000000 < share
 
 
 class GatewayError(Exception):
@@ -193,6 +206,7 @@ class Gateway:
         self.alerts = alerts
         self.rng = rng or random.Random()
         self.clock = clock
+        self.metrics = Metrics(__version__)
 
     def resolve_mode(self, requested: str) -> tuple[str, str | None]:
         """(mode, pinned model alias) for the request's ``model`` field."""
@@ -211,7 +225,9 @@ class Gateway:
         now = self.clock()
         record = RequestRecord(id=ctx.request_id, ts=iso(now), app_id=ctx.app_id, requested_model=request.model,
                                stream=request.stream)
+        lease: str | None = None
         try:
+            lease = await self._admit_client(ctx.app_id)
             result = await self._run(request, ctx, record, now)
             record.status, record.http_status = "ok", 200
             return result
@@ -232,6 +248,7 @@ class Gateway:
             self._fail(record, error, detail=f"{type(e).__name__}: {e}")
             raise error from e
         finally:
+            await self._release_client(ctx.app_id, lease)
             await self._finish(record, started)  # also settles the request's budget reservation
 
     async def stream(
@@ -247,16 +264,20 @@ class Gateway:
         now = self.clock()
         record = RequestRecord(id=ctx.request_id, ts=iso(now), app_id=ctx.app_id, requested_model=request.model,
                                stream=True)
+        lease: str | None = None
         try:
-            return await self._open_stream(request, ctx, record, now, started, expose_metadata)
+            lease = await self._admit_client(ctx.app_id)
+            events, headers = await self._open_stream(request, ctx, record, now, started, expose_metadata)
         except GatewayError as e:
             if record.http_status is None:  # not recorded yet by the provider-failure paths
                 self._fail(record, e)
+            await self._release_client(ctx.app_id, lease)
             await self._finish(record, started)
             raise
         except ProviderError as e:
             error = from_provider_error(e)
             self._fail(record, error, detail=upstream_detail(record.id, e))
+            await self._release_client(ctx.app_id, lease)
             await self._finish(record, started)
             raise error from e
         except asyncio.CancelledError:
@@ -264,14 +285,106 @@ class Gateway:
             record.error_message = "client disconnected or request cancelled before the first chunk"
             if record.calls and record.calls[-1].status == "ok" and record.calls[-1].latency_ms is None:
                 record.calls[-1].status, record.calls[-1].error_type = "error", "cancelled"
+            await self._release_client(ctx.app_id, lease)
             await self._finish(record, started)
             raise
         except Exception as e:
             log.exception("streaming request %s failed", ctx.request_id)
             error = GatewayError(500, "internal gateway error", type_="server_error", code="internal_error")
             self._fail(record, error, detail=f"{type(e).__name__}: {e}")
+            await self._release_client(ctx.app_id, lease)
             await self._finish(record, started)
             raise error from e
+        if lease is None:
+            return events, headers
+        return self._holding_lease(events, ctx.app_id, lease), headers
+
+    async def _choose_tier(self, record: RequestRecord, mode: str, pinned: str | None, release: Release,
+                           release_name: str, latency: str, threshold: float, classifier: bool,
+                           app_messages: list[dict[str, Any]], notes: list[str]) -> str:
+        """The tier that answers, and in shadow mode what the trained classifier would have chosen.
+
+        With ``routing.classifier_share`` below 1, the classifier routes only that share of router-mode requests
+        (a hash of the request id decides, so a retry with the same id lands in the same group); the rest form a
+        control group answered by the strong tier. The classifier is only trusted for the model pair it was
+        trained on: another pair is sent to the strong tier and never shadow-scored.
+        """
+        expected = (release.model_for("cheap", latency), release.model_for("strong", latency))
+        trained = getattr(self.router, "model_aliases", None)
+        if pinned:
+            tier = "pinned"
+        elif mode == "router":
+            share = self.config.routing.classifier_share
+            if classifier and trained != expected:
+                record.router = self.router.name
+                notes.append(
+                    f"classifier trained for {trained}; release {release_name} {latency} uses {expected}: strong model"
+                )
+                tier = "strong"
+            elif classifier and not in_share(record.id, share):
+                record.router = "control"
+                notes.append(f"control group (the classifier routes {share:.0%} of requests): strong model")
+                tier = "strong"
+            else:
+                t = time.perf_counter()
+                score = self.router.score(app_messages)
+                record.router_ms = round((time.perf_counter() - t) * 1000, 3)
+                record.router, record.route_score = score.router, score.score
+                notes.append(score.reason)
+                tier = choose_tier(score.score, threshold)
+        else:
+            tier = "cheap" if mode == "cascade" else mode
+        if (self.config.routing.shadow and not pinned and self.router.name == "classifier"
+                and record.router != "classifier" and trained == expected):
+            try:
+                shadow = await asyncio.to_thread(self.router.score, app_messages)
+                record.shadow_score = shadow.score
+                record.shadow_tier = choose_tier(shadow.score, self.config.routing.classifier_threshold)
+            except Exception:  # shadow scoring must never fail a request
+                log.exception("shadow routing failed for request %s", record.id)
+        return tier
+
+    async def _holding_lease(self, events: AsyncIterator[str], app_id: str, lease: str) -> AsyncIterator[str]:
+        """Pass a started stream's events through, holding the client's concurrency slot until it ends
+        (finished, failed or abandoned by a disconnected client)."""
+        try:
+            async for event in events:
+                yield event
+        finally:
+            try:
+                aclose = getattr(events, "aclose", None)
+                if aclose is not None:
+                    await aclose()
+            finally:
+                await self._release_client(app_id, lease)
+
+    async def _admit_client(self, app_id: str) -> str | None:
+        """Admit one request of ``app_id`` under its per-client limits (config ``client_limits``), shared by
+        every replica through the state backend. Returns a lease to release when the request ends, or None
+        when the client has no limits. Raises 429 ``client_rate_limited`` (with Retry-After) when refused."""
+        limit = self.config.client_limits.for_app(app_id)
+        if limit.rpm == 0 and limit.concurrency == 0:
+            return None
+        admission = await asyncio.to_thread(self.registry.state.admit_client, app_id, limit.rpm,
+                                            limit.concurrency, self.config.client_limits.lease_s)
+        if not admission.admitted:
+            if admission.reason == "state_unavailable":
+                message = "request limits can't be checked right now (shared state unavailable); retry shortly"
+            elif admission.reason == "concurrency":
+                message = f"too many requests in progress for app {app_id!r} (limit {limit.concurrency})"
+            else:
+                message = f"request rate limit for app {app_id!r} reached ({limit.rpm} per minute)"
+            raise GatewayError(429, message, type_="rate_limit_error", code="client_rate_limited",
+                               retry_after=max(1.0, admission.retry_after), counts_as_error=False)
+        return admission.lease_id
+
+    async def _release_client(self, app_id: str, lease: str | None) -> None:
+        if lease is None:
+            return
+        try:
+            await asyncio.to_thread(self.registry.state.release_client, app_id, lease)
+        except Exception:  # an unreleased lease expires after client_limits.lease_s
+            log.exception("could not release the concurrency lease of app %s", app_id)
 
     async def _open_stream(self, request: ChatRequest, ctx: RequestContext, record: RequestRecord, now: datetime,
                            started: float, expose_metadata: bool) -> tuple[AsyncIterator[str], dict[str, str]]:
@@ -307,26 +420,8 @@ class Gateway:
                              else self.config.routing.threshold)
         threshold = default_threshold if ctx.threshold is None else ctx.threshold
         record.mode, record.threshold, record.latency_class = ("pinned" if pinned else mode), threshold, latency
-        if pinned:
-            tier = "pinned"
-        elif mode == "router":
-            expected = (release.model_for("cheap", latency), release.model_for("strong", latency))
-            trained = getattr(self.router, "model_aliases", None)
-            if classifier and trained != expected:
-                record.router = self.router.name
-                notes.append(
-                    f"classifier trained for {trained}; release {release_name} {latency} uses {expected}: strong model"
-                )
-                tier = "strong"
-            else:
-                t = time.perf_counter()
-                score = self.router.score(app_messages)
-                record.router_ms = round((time.perf_counter() - t) * 1000, 3)
-                record.router, record.route_score = score.router, score.score
-                notes.append(score.reason)
-                tier = choose_tier(score.score, threshold)
-        else:
-            tier = "cheap" if mode == "cascade" else mode
+        tier = await self._choose_tier(record, mode, pinned, release, release_name, latency, threshold, classifier,
+                                       app_messages, notes)
         alias = pinned or release.model_for(tier, latency)
         params = request.params()
 
@@ -589,26 +684,8 @@ class Gateway:
                              else self.config.routing.threshold)
         threshold = default_threshold if ctx.threshold is None else ctx.threshold
         record.mode, record.threshold, record.latency_class = ("pinned" if pinned else mode), threshold, latency
-        if pinned:
-            tier = "pinned"
-        elif mode == "router":
-            expected = (release.model_for("cheap", latency), release.model_for("strong", latency))
-            trained = getattr(self.router, "model_aliases", None)
-            if classifier and trained != expected:
-                record.router = self.router.name
-                notes.append(
-                    f"classifier trained for {trained}; release {release_name} {latency} uses {expected}: strong model"
-                )
-                tier = "strong"
-            else:
-                t = time.perf_counter()
-                score = self.router.score(app_messages)
-                record.router_ms = round((time.perf_counter() - t) * 1000, 3)
-                record.router, record.route_score = score.router, score.score
-                notes.append(score.reason)
-                tier = choose_tier(score.score, threshold)
-        else:
-            tier = "cheap" if mode == "cascade" else mode
+        tier = await self._choose_tier(record, mode, pinned, release, release_name, latency, threshold, classifier,
+                                       app_messages, notes)
         alias = pinned or release.model_for(tier, latency)
         params = request.params()
 
@@ -755,6 +832,11 @@ class Gateway:
         except Exception:
             log.exception("could not log request %s (status %s, http %s, error %s, cost $%.8f)", record.id,
                           record.status, record.http_status, record.error_type, record.cost_usd)
+        try:
+            self.metrics.observe(record)
+            log_access(record)
+        except Exception:
+            log.exception("could not record metrics for request %s", record.id)
         if self.alerts is not None:
             try:
                 await asyncio.to_thread(self.alerts.maybe_check)

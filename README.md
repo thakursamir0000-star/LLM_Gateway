@@ -37,7 +37,8 @@ See [Validation status](#validation-status).
 | Gemini API adapter | yes | yes (mocked HTTP) | – | no | no |
 | Retries, fallback, quota cooldowns, circuit breakers | yes | yes | yes: shared across two replicas through Redis | fallback only: Groq 401 → OpenRouter in the smoke test | no |
 | Rules router, cascade | yes | yes | – | no | no |
-| Trained classifier router | yes, **not active** | yes | offline held-out evaluation | on real benchmark answers, offline | no |
+| Trained classifier router (v1; v2 evaluated and not promoted) | yes, **not active** | yes | offline held-out evaluation | on real benchmark answers, offline | no |
+| Router shadow mode and controlled activation (classifier share, control group) | yes, **off** | yes | – | – | no |
 | Per-app budgets with atomic reservations | yes | yes | yes: PostgreSQL 16, two replicas | no | no |
 | Request log, metrics, alerts | yes | yes | yes: PostgreSQL 16 | no | no |
 | Releases, canary, rollback | yes | yes | yes: PostgreSQL 16, concurrent changes | – | no |
@@ -46,7 +47,9 @@ See [Validation status](#validation-status).
 | Authentication, admin key, body limits, CORS, generic upstream errors | yes | yes | yes: 401 without a key in the Docker smoke test | – | no |
 | Locked, hash-checked dependencies; digest-pinned base image; vulnerability audit | yes | – | yes: CI installs the locks, audit workflow on every push and weekly | – | – |
 | HTTPS proxy (TLS 1.2/1.3, redirect, security headers), dashboard password, admin API not published | yes | yes (password hashing) | yes: two-replica Docker check | – | no |
-| Prometheus metrics, per-client rate limits, backups | **no** | – | – | – | – |
+| Per-client request limits (requests per minute, requests in flight) | yes | yes | yes: real Redis 7, two backends sharing one allowance | – | no |
+| Prometheus metrics, JSON access logs, Grafana dashboard, alert rules | yes | yes | – | – | no |
+| Request-log retention, backup and restore (with a restore drill) | yes | yes (SQLite) | yes: retention on PostgreSQL 16, backup drill on the Compose database | – | no |
 
 "Integration tested" means against real PostgreSQL, Redis or Docker Compose (`tests/test_postgres_integration.py`,
 `tests/test_redis_*.py`, `scripts/redis_outage_drill.py`, `scripts/multi_instance_check.py`).
@@ -356,6 +359,8 @@ Phase 1 security hardening enforces production-safe defaults:
   - *Client Migration*: Any client calling the gateway must supply `Authorization: Bearer <key>`. For local development
     or offline demos where anonymous access via `X-App-Id` is desired, explicitly set `GATEWAY_ALLOW_ANONYMOUS=1` or
     `auth.allow_anonymous: true` in the configuration.
+  - *Key storage and rotation*: keys may be stored as `app:sha256:<hex>` (from `scripts/make_api_key.py`) and read
+    from a mounted file (`GATEWAY_API_KEYS_FILE`); an app may hold several keys while it rotates (see SECURITY.md).
 - **Internal Metadata Protection**: By default (`security.expose_internal_metadata: false`), response payloads contain
   standard OpenAI-compatible fields (`id`, `object`, `created`, `model`, `choices`, `usage`). The custom `gateway`
   diagnostic dictionary and internal headers (`x-gateway-model`, `x-gateway-tier`, `x-gateway-release`,
@@ -381,10 +386,77 @@ Phase 1 security hardening enforces production-safe defaults:
   request records its real cost and drops its reservation in the same transaction; a reservation a crashed process
   never settled expires after `budgets.reservation_ttl_s`. A request is admitted while any budget is left, so the
   last one admitted can still overshoot by the part of its real cost its reservation didn't cover.
+- **Per-client request limits**: `client_limits.default` and `client_limits.apps.<app>` set `rpm` (requests per
+  minute) and `concurrency` (requests in flight, streams included until they end) per client; 0 means no limit. The
+  shipped config allows 600 per minute and 50 at once (`demo`: 60 and 5). The counters live in Redis, so every
+  replica shares one allowance (in-process with the memory backend). A refusal answers 429 `client_rate_limited`
+  with `Retry-After`, is logged as rejected, and calls no provider. Only validated clients are counted: an invalid or
+  revoked key gets 401 first and uses none of the allowance. A slot a crashed replica never released expires after
+  `client_limits.lease_s`. While Redis is down the outage policy applies (`fail_closed`: 429; `local_share`: each
+  replica allows `limit // replicas`). Token-per-minute limits per client are not implemented; daily USD budgets
+  cap spend.
 - **Feedback**: `POST /v1/feedback {"request_id": "<response id>", "score": "up" | "down" | 1 | -1, "comment": "..."}`.
 - **Alerts**: error rate over the last `window_minutes` (with at least `min_requests`) above `alerts.error_rate`, or
   today's cost above `alerts.daily_cost_usd`. Each alert is logged, stored (the dashboard shows it), and POSTed as JSON
   to `ALERT_WEBHOOK_URL` when set; it fires at most once per window (error rate) or per day (cost).
+
+## Metrics and logs
+
+- **`GET /metrics`** (Prometheus text format, per replica): `gateway_requests_total{app,status,tier,error_type,stream}`,
+  `gateway_request_duration_seconds` (histogram), `gateway_tokens_total{app,model,kind}`,
+  `gateway_cost_usd_total{app,model}`, `gateway_provider_calls_total{model,status,error_type}`,
+  `gateway_provider_call_duration_seconds`, `gateway_fallbacks_total`, `gateway_escalations_total`,
+  `gateway_state_degraded` and `gateway_build_info`. Every finished request is counted once, from the same record
+  the request log stores. Labels never hold prompt text, keys or provider messages; at most 100 distinct app ids
+  are kept, later ones count as `other`. The HTTPS proxy answers 403 for `/metrics`; set `GATEWAY_METRICS_TOKEN`
+  to require `Authorization: Bearer <token>` from scrapers as well.
+- **Logs**: `GATEWAY_LOG_FORMAT=json` (set in Compose) writes one JSON object per line, and one `gateway.access`
+  line per request (id, app, outcome, model, tokens, cost, latency; no content).
+- **Prometheus and Grafana**: `docker compose --profile monitoring up -d` adds Prometheus (`127.0.0.1:9090`,
+  scraping both replicas, alert rules in `config/prometheus/alerts.yml`: error rate, Redis degraded, replica down,
+  slow p95) and Grafana (`127.0.0.1:3000`, admin password from `GRAFANA_ADMIN_PASSWORD`, the provisioned "LLM
+  Gateway" dashboard). Routing the alerts to a pager needs an Alertmanager, which is not included.
+
+## Retention, backup and restore
+
+- **Retention**: `python -m gateway.manage retention --dry-run` counts, `--yes` deletes, in one transaction,
+  requests, calls, feedback and alerts older than `storage.retention_days` (default 90, at least 2 so today's budget
+  spend stays) or `--days N`, and budget reservations that have expired. Deployments are kept as the release audit
+  trail. Run it daily (cron, a Kubernetes CronJob or `docker compose run --rm gateway python -m gateway.manage
+  retention --yes`).
+- **Backup**: `python scripts/db_backup.py backup` writes a custom-format `pg_dump` of the Compose database to
+  `var/backups/` (`--local` uses `pg_dump` on this machine with `$GATEWAY_DATABASE_URL`; SQLite uses the online
+  backup API). Backups contain app ids, costs and feedback comments: store them encrypted and off-site.
+- **Restore**: `python scripts/db_backup.py restore <archive> --target <new database> --yes` restores next to the
+  live database; overwriting the live one also needs `--overwrite-live`.
+- **Drill**: `python scripts/db_backup.py drill` backs up, restores into a scratch database, compares the row
+  count of every table and the Alembic revision, and drops the scratch database. Run it after every schema change
+  and on a schedule; it passed on the Compose PostgreSQL 16 database (5 requests, revision 0003).
+
+## Router shadow mode and controlled activation
+
+The trained classifier is never switched on in one step. Three stages, each read with `scripts/router_report.py`
+(from the request log; `--json` to save it):
+
+1. **Shadow** (`routing.shadow: true`): every routable request is still answered as configured, and the classifier
+   is asked which tier it would have chosen; `requests.shadow_tier`/`shadow_score` and
+   `gateway_shadow_decisions_total` record it. The report gives agreement with the tier used, the share it would
+   send to the cheap model, and an estimated saving (strong answers it would have sent cheap, re-priced at the cheap
+   model's list price). It cannot tell whether those cheap answers would have been good enough: compare user
+   feedback per group, and sample requests for review.
+2. **Canary** (`default_mode: router` or `model="router"`, with `routing.classifier_share: 0.05`): the classifier
+   routes that share of router-mode requests, chosen by a hash of the request id; the rest are a control group
+   answered by the strong tier (and shadow-scored). The report compares the groups' error rate, cost, latency and
+   feedback. Raise the share in steps (0.05, 0.25, 1.0) only when the classifier group is no worse.
+3. **Rollback** at any stage: `classifier_share: 0` (or `routing.router: rules`) and a rolling restart.
+
+Only the model pair the classifier was trained for is ever routed or shadow-scored by it; with the shipped config
+that is the OpenRouter batch pair. The shipped config keeps shadow off and `default_mode: strong`, and
+`models/router.json` is not installed: turning any of this on is a deployment decision.
+
+Retraining from feedback (Phase 6.6) is not built. The request log stores no prompt text, by design, so thumbs-up
+or thumbs-down ratings can't be joined to the questions they rate. A retraining set would need an opt-in prompt
+capture with its own retention and consent, and enough rated traffic to beat the 900 benchmark questions.
 
 ## Router lab: data, training, evaluation
 
@@ -475,6 +547,33 @@ training scores and mirrored by `routing.classifier_threshold`. A mismatch preve
 
 The rules baseline selected a threshold that sent every held-out question to the strong model. The cascade also
 escalated every question and cost 83% more than always-strong, so neither improved this OpenRouter pair.
+
+### Router v2 (2026-11-22, offline)
+
+A second classifier, MiniLM embeddings plus hashed word and word-pair features, trained and evaluated exactly like
+v1, scored better in cross-validation (out-of-fold AUC 0.648 vs 0.638) but not on the held-out questions: 87.0%
+accuracy with a 12% saving (v1: 88.0%, 8%), only 0.3 points above random routing at its strong share, and not
+significantly different from always-strong (p = 0.125). v1 stays the candidate. Details:
+[`results/router_v2.md`](results/router_v2.md).
+
+### Load test (measured 2026-11-22, fake providers)
+
+`scripts/load_test.py` against the Compose stack on one Windows laptop (two replicas, PostgreSQL 16, Redis 7, client
+on the same machine), 20% of requests streamed. Fake providers: no paid calls, so this measures the gateway, its
+database and Redis, not a provider. Raw results: [`results/load_test.json`](results/load_test.json).
+
+| Run | Clients | Requests | Throughput | Status codes | p50 / p95 / p99 latency (successful) |
+|---|---|---|---|---|---|
+| Baseline, one client | 1 | 24 in 22 s | 1.1/s | 24 × 200 | 815 / 1,985 / 2,646 ms |
+| Client limits off | 50 | 3,370 in 61 s | 55/s | 3,370 × 200 | 842 / 1,396 / 2,815 ms |
+| Shipped client limits (600/min) | 80 | 7,278 in 63 s | 116/s | 650 × 200, 6,628 × 429 | 1,498 / 4,047 / 5,232 ms |
+
+- Most of the latency is the fake provider's simulated delay: the median moved from 815 ms with one client to 842 ms
+  with 50. Throughput at 50 clients was bound by that delay, not by a gateway error; no request failed.
+- With the default limits, the busiest 60-second window in the request log held exactly 600 successful requests:
+  the per-client limit held across both replicas through Redis. The 429s carry `Retry-After`.
+- Every request was counted once by `/metrics` (`gateway_counted` equals `requests` in all three runs).
+- Not measured: real providers under load, the HTTPS proxy in the path, hosts other than this laptop.
 
 ### Provider comparison (measured 2026-11-15 to 2026-11-16)
 
@@ -733,27 +832,30 @@ tests/              pytest suite
 | Every request answers 401 `auth_required` | no `GATEWAY_API_KEYS` and anonymous access off: configure keys, or `GATEWAY_ALLOW_ANONYMOUS=1` for local demos |
 | `/ready` answers 503 | the database or Redis is unreachable; `/health` shows which (`state.degraded`) |
 | 429 `rate_limit_exceeded` while Redis is down | the `fail_closed` outage policy at work; restore Redis, or choose `local_share` with `GATEWAY_REPLICAS` |
+| 429 `client_rate_limited` | the client's `client_limits` (requests per minute or in flight) are reached; wait `Retry-After` seconds or raise the limit |
 | 429 `budget_exceeded` | the app's daily budget (UTC day) is spent or held by requests in progress |
 | PostgreSQL tests skip | set `TEST_POSTGRES_URL` to a test database (its name must contain "test") |
 | `psycopg` fails to import on Windows | a policy blocking native DLLs; run PostgreSQL work in Docker or WSL |
 
 ## Production deployment prerequisites
 
+The step-by-step deployment, upgrade, incident and key-rotation procedures are in [docs/RUNBOOK.md](docs/RUNBOOK.md).
+
 Not met by the repository alone: provide them before exposing the gateway.
 
 - `GATEWAY_ENV=production` with PostgreSQL, Redis (`noeviction`), client keys and an admin key; start-up refuses less.
 - A certificate from a real CA for the nginx `proxy` (the bundled script makes self-signed development ones), and a
   strong dashboard password (`DASHBOARD_PASSWORD`).
-- Backups of PostgreSQL and a retention policy for the request log (none are automated yet).
-- Monitoring beyond `/health`, `/ready` and the dashboard (no Prometheus endpoint yet).
+- Scheduled `retention --yes`, scheduled backups copied off the host (encrypted), and a periodic restore drill.
+- An Alertmanager (or another receiver) for the Prometheus alert rules, and Grafana behind your SSO or VPN.
 
 ## Limitations and next steps
 
 - Real providers through the gateway's HTTP API are verified by one smoke run (`scripts/real_provider_smoke.py`, four
   requests); the test suite itself uses fake providers or mocked HTTP. Gemini has not been called for real.
-- Nothing is deployed. There are no Prometheus metrics, no per-client rate limit (only daily
-  budgets) and no automated backup or retention.
-- Redis is used through a synchronous client, so each Redis call briefly blocks the event loop.
+- Nothing is deployed. Retention and backups are commands to schedule; nothing schedules them yet.
+- Redis is used through a synchronous client whose calls run in worker threads (never on the event loop); each
+  call still holds a thread for one round trip, which bounds Redis throughput by the thread pool.
 - The trained classifier is evaluated (see [Results](#results)) but not shipped: `models/router.json` is not
   committed, so `model="router"` requests use the rule-based router. On the held-out questions it saved 8% against
   always-strong with no significant accuracy difference, on benchmark questions only.

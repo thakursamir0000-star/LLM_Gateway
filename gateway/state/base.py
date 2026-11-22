@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
 from gateway.circuit import CircuitState, ProbeToken
@@ -53,6 +54,16 @@ class CircuitBreakerProtocol(Protocol):
     def reset(self) -> None: ...
 
 
+@dataclass(frozen=True)
+class ClientAdmission:
+    """The outcome of ``StateBackend.admit_client``."""
+
+    admitted: bool
+    lease_id: str | None = None  # release it with release_client when the request ends
+    retry_after: float = 0.0
+    reason: str = ""  # "rpm", "concurrency" or "state_unavailable" when refused
+
+
 class StateBackend(Protocol):
     """Abstract shared state backend for rate limits, cooldowns, and circuit breakers."""
 
@@ -63,6 +74,10 @@ class StateBackend(Protocol):
     def get_rate_limiter(self, alias: str, rpm: int, tpm: int) -> RateLimiterProtocol: ...
 
     def get_circuit_breaker(self, name: str, config: CircuitBreakerConfig) -> CircuitBreakerProtocol: ...
+
+    def admit_client(self, app_id: str, rpm: int, concurrency: int, lease_s: float) -> ClientAdmission: ...
+
+    def release_client(self, app_id: str, lease_id: str) -> None: ...
 
     def is_ready(self) -> tuple[bool, str]: ...
 

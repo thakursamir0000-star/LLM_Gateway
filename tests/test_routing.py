@@ -200,3 +200,14 @@ def test_escalation_follows_the_threshold():
     assert not should_escalate(good, 0.5) and should_escalate(hedged, 0.5)
     assert should_escalate(good, 0.95)  # a very high threshold escalates everything
     assert not should_escalate(hedged, 0.0)  # threshold 0 never escalates
+
+
+def test_concat_embedder_joins_and_normalises_its_parts():
+    import numpy as np
+
+    from gateway.routing.embeddings import load_embedder
+
+    concat = load_embedder("concat:hashing:16+hashing:8")
+    vectors = concat.embed(["what is two plus two", "translate hello"])
+    assert concat.name == "concat:hashing:16+hashing:8" and vectors.shape == (2, 24)
+    assert np.allclose(np.linalg.norm(vectors, axis=1), 1.0)

@@ -106,6 +106,12 @@ class RoutingConfig(_Strict):
     classifier_threshold: float = Field(0.5, ge=0, le=1)
     threshold: float = Field(0.5, ge=0, le=1)
     fallback_on_error: bool = True
+    # Shadow mode: score every routable request with the trained classifier and log what it would choose
+    # (requests.shadow_tier/shadow_score), without acting on it. Needs a loaded classifier.
+    shadow: bool = False
+    # Controlled activation: the share of router-mode requests the classifier routes, picked by a hash of the
+    # request id; the rest go to the strong tier as the control group (and are shadow-scored).
+    classifier_share: float = Field(1.0, ge=0, le=1)
 
 
 class RetryConfig(_Strict):
@@ -145,6 +151,27 @@ class BudgetConfig(_Strict):
     reservation_ttl_s: float = Field(900.0, gt=0)
 
 
+class ClientLimit(_Strict):
+    rpm: int = Field(0, ge=0)  # requests per minute per client (0 = no limit)
+    concurrency: int = Field(0, ge=0)  # requests in flight at once per client (0 = no limit)
+
+
+class ClientLimitsConfig(_Strict):
+    """Per-client request limits, enforced across replicas through the state backend (Redis).
+
+    A client is the app its validated API key names (or its X-App-Id when anonymous access is enabled). Daily
+    USD budgets are separate (``budgets``). A request in flight holds a lease that expires after ``lease_s``, so
+    a crashed replica can't hold a client's concurrency slots forever.
+    """
+
+    default: ClientLimit = Field(default_factory=ClientLimit)
+    apps: dict[str, ClientLimit] = {}
+    lease_s: float = Field(600.0, gt=0)
+
+    def for_app(self, app_id: str) -> ClientLimit:
+        return self.apps.get(app_id, self.default)
+
+
 class AlertConfig(_Strict):
     error_rate: float = Field(0.2, ge=0, le=1)
     window_minutes: int = Field(15, ge=1)
@@ -156,6 +183,7 @@ class AlertConfig(_Strict):
 
 class AuthConfig(_Strict):
     keys_env: str = "GATEWAY_API_KEYS"
+    keys_file_env: str = "GATEWAY_API_KEYS_FILE"
     admin_key_env: str = "GATEWAY_ADMIN_KEY"
     allow_anonymous: bool = False
 
@@ -172,6 +200,8 @@ class StorageConfig(_Strict):
     max_overflow: int = Field(10, ge=0)
     pool_timeout_s: float = Field(30, gt=0)
     pool_recycle_s: int = Field(1800, ge=0)
+    # Request log retention for `python -m gateway.manage retention` (the budget needs today's rows: at least 2).
+    retention_days: int = Field(90, ge=2)
 
 
 class RedisConfig(_Strict):
@@ -203,6 +233,7 @@ class GatewayConfig(_Strict):
     retries: RetryConfig = Field(default_factory=RetryConfig)
     circuit_breaker: CircuitBreakerConfig = Field(default_factory=CircuitBreakerConfig)
     budgets: BudgetConfig = Field(default_factory=BudgetConfig)
+    client_limits: ClientLimitsConfig = Field(default_factory=ClientLimitsConfig)
     alerts: AlertConfig = Field(default_factory=AlertConfig)
     auth: AuthConfig = Field(default_factory=AuthConfig)
     security: SecurityConfig = Field(default_factory=SecurityConfig)

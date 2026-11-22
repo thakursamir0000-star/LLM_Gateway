@@ -1,0 +1,31 @@
+groups:
+  - name: gateway
+    rules:
+      - alert: GatewayHighErrorRate
+        expr: |
+          sum(rate(gateway_requests_total{status="error"}[10m]))
+            / clamp_min(sum(rate(gateway_requests_total[10m])), 1e-9) > 0.2
+          and sum(increase(gateway_requests_total[10m])) > 20
+        for: 5m
+        labels: {severity: page}
+        annotations:
+          summary: "More than 20% of gateway requests failed over 10 minutes"
+      - alert: GatewayStateDegraded
+        expr: max(gateway_state_degraded) == 1
+        for: 2m
+        labels: {severity: page}
+        annotations:
+          summary: "A gateway replica can't reach Redis (outage policy in effect)"
+      - alert: GatewayReplicaDown
+        expr: up{job="gateway"} == 0
+        for: 2m
+        labels: {severity: page}
+        annotations:
+          summary: "A gateway replica is not answering scrapes"
+      - alert: GatewaySlowRequests
+        expr: |
+          histogram_quantile(0.95, sum by (le) (rate(gateway_request_duration_seconds_bucket{status="ok"}[10m]))) > 10
+        for: 10m
+        labels: {severity: ticket}
+        annotations:
+          summary: "p95 latency of successful requests above 10 s"

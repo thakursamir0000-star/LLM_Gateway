@@ -13,7 +13,7 @@ import redis
 from gateway.circuit import CircuitState, ProbeToken
 from gateway.config import CircuitBreakerConfig, RedisConfig
 from gateway.ratelimit import RateLimited, Reservation
-from gateway.state.base import CircuitBreakerProtocol, RateLimiterProtocol, StateBackend
+from gateway.state.base import CircuitBreakerProtocol, ClientAdmission, RateLimiterProtocol, StateBackend
 
 log = logging.getLogger("gateway.state.redis")
 
@@ -290,6 +290,40 @@ return 1
 """
 
 
+LUA_CLIENT_ADMIT = """
+local rpm_key = KEYS[1]
+local inflight_key = KEYS[2]
+local rpm = tonumber(ARGV[1])
+local concurrency = tonumber(ARGV[2])
+local lease_s = tonumber(ARGV[3])
+local lease_id = ARGV[4]
+
+local time_arr = redis.call('TIME')
+local now = tonumber(time_arr[1]) + (tonumber(time_arr[2]) / 1000000)
+
+redis.call('ZREMRANGEBYSCORE', rpm_key, '-inf', now - 60)
+redis.call('ZREMRANGEBYSCORE', inflight_key, '-inf', now)
+
+if concurrency > 0 and redis.call('ZCARD', inflight_key) >= concurrency then
+    return {0, '1.0', 'concurrency'}
+end
+if rpm > 0 then
+    local count = redis.call('ZCARD', rpm_key)
+    if count >= rpm then
+        local oldest = redis.call('ZRANGE', rpm_key, count - rpm, count - rpm, 'WITHSCORES')
+        return {0, tostring(math.max(0, tonumber(oldest[2]) + 60 - now)), 'rpm'}
+    end
+    redis.call('ZADD', rpm_key, now, lease_id)
+    redis.call('EXPIRE', rpm_key, 120)
+end
+if concurrency > 0 then
+    redis.call('ZADD', inflight_key, now + lease_s, lease_id)
+    redis.call('EXPIRE', inflight_key, math.ceil(lease_s) + 60)
+end
+return {1, '0', ''}
+"""
+
+
 class RedisCooldowns:
     def __init__(self, backend: RedisStateBackend):
         self._backend = backend
@@ -371,7 +405,8 @@ class RedisRateLimiter(RateLimiterProtocol):
         reservation_id = uuid.uuid4().hex
         while True:
             try:
-                res = self._backend.scripts["ratelimit_wait_and_reserve"](
+                res = await asyncio.to_thread(
+                    self._backend.scripts["ratelimit_wait_and_reserve"],
                     keys=[self._zset_key, self._items_key],
                     args=[self.rpm, self.tpm, tokens, reservation_id, "1"],
                 )
@@ -505,7 +540,13 @@ class RedisCircuitBreaker(CircuitBreakerProtocol):
 
 
 class RedisStateBackend(StateBackend):
-    """Production Redis-backed shared state backend."""
+    """Production Redis-backed shared state backend.
+
+    The client is synchronous: every call is a network round trip, so async code runs them in a worker thread
+    (``blocking``; see ModelRegistry._io and the rate limiter's acquire), never on the event loop.
+    """
+
+    blocking = True
 
     def __init__(self, config: RedisConfig):
         self.config = config
@@ -540,6 +581,7 @@ class RedisStateBackend(StateBackend):
             "circuit_record_neutral": self.client.register_script(LUA_CIRCUIT_RECORD_NEUTRAL),
             "circuit_get_state": self.client.register_script(LUA_CIRCUIT_GET_STATE),
             "circuit_reset": self.client.register_script(LUA_CIRCUIT_RESET),
+            "client_admit": self.client.register_script(LUA_CLIENT_ADMIT),
         }
 
     def mark_degraded(self, error: Exception) -> None:
@@ -565,6 +607,32 @@ class RedisStateBackend(StateBackend):
                 return max(1, limit // self.config.replicas) if limit else 0
             return self.fallback_backend.get_rate_limiter(alias, share(rpm), share(tpm))
         return None
+
+    def admit_client(self, app_id: str, rpm: int, concurrency: int, lease_s: float) -> ClientAdmission:
+        """Atomically check and record one request for a client across all replicas (Redis server time)."""
+        lease_id = uuid.uuid4().hex
+        try:
+            admitted, retry_after, reason = self.scripts["client_admit"](
+                keys=[f"gateway:client:{app_id}:rpm", f"gateway:client:{app_id}:inflight"],
+                args=[rpm, concurrency, lease_s, lease_id],
+            )
+        except (redis.ConnectionError, redis.TimeoutError) as e:
+            self.mark_degraded(e)
+            if self.config.outage_policy == "local_share":
+                def share(limit: int) -> int:
+                    return max(1, limit // self.config.replicas) if limit else 0
+                return self.fallback_backend.admit_client(app_id, share(rpm), share(concurrency), lease_s)
+            return ClientAdmission(False, retry_after=self.config.outage_retry_after_s, reason="state_unavailable")
+        if int(admitted):
+            return ClientAdmission(True, lease_id=lease_id)
+        return ClientAdmission(False, retry_after=float(retry_after), reason=str(reason))
+
+    def release_client(self, app_id: str, lease_id: str) -> None:
+        try:
+            self.client.zrem(f"gateway:client:{app_id}:inflight", lease_id)
+        except (redis.ConnectionError, redis.TimeoutError) as e:
+            self.mark_degraded(e)  # the lease expires on its own
+            self.fallback_backend.release_client(app_id, lease_id)
 
     def cooldown_left(self, alias: str) -> float:
         return self.cooldowns.cooldown_left(alias)

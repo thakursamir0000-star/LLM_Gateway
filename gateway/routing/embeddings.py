@@ -5,6 +5,9 @@
   (requirements-lab.txt, or the Docker build arg WITH_EMBEDDINGS=true).
 - ``hashing:<dim>``: a deterministic hashed bag of words and word pairs. No
   download, no model: used by the tests and as a light fallback.
+- ``concat:<spec>+<spec>``: the parts' embeddings side by side, each weighted
+  equally, then normalised (router v2: a sentence embedding plus lexical
+  features).
 Embeddings are L2-normalised float32 rows.
 """
 
@@ -69,6 +72,17 @@ class SentenceTransformerEmbedder:
         return np.asarray(vectors, dtype=np.float32)
 
 
+class ConcatEmbedder:
+    def __init__(self, parts: list[Embedder]):
+        if len(parts) < 2:
+            raise ValueError("concat embedder needs at least two parts")
+        self.parts = parts
+        self.name = "concat:" + "+".join(part.name for part in parts)
+
+    def embed(self, texts: list[str]) -> np.ndarray:
+        return _normalise(np.hstack([part.embed(texts) for part in self.parts]))
+
+
 _CACHE: dict[str, Embedder] = {}
 _LOCK = threading.Lock()
 
@@ -77,9 +91,19 @@ def load_embedder(spec: str) -> Embedder:
     """The embedder named by ``spec`` (loaded once per process)."""
     with _LOCK:
         if spec not in _CACHE:
-            if spec.startswith("hashing"):
+            if spec.startswith("concat:"):
+                names = spec[len("concat:"):].split("+")
+                _CACHE[spec] = ConcatEmbedder([_load_one(name) for name in names])
+            elif spec.startswith("hashing"):
                 _, _, dim = spec.partition(":")
                 _CACHE[spec] = HashingEmbedder(int(dim) if dim else 512)
             else:
                 _CACHE[spec] = SentenceTransformerEmbedder(spec)
         return _CACHE[spec]
+
+
+def _load_one(spec: str) -> Embedder:
+    if spec.startswith("hashing"):
+        _, _, dim = spec.partition(":")
+        return HashingEmbedder(int(dim) if dim else 512)
+    return SentenceTransformerEmbedder(spec)
