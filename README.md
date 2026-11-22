@@ -520,6 +520,25 @@ training scores and mirrored by `routing.classifier_threshold`. A mismatch preve
 The rules baseline selected a threshold that sent every held-out question to the strong model. The cascade also
 escalated every question and cost 83% more than always-strong, so neither improved this OpenRouter pair.
 
+### Load test (measured 2026-11-22, fake providers)
+
+`scripts/load_test.py` against the Compose stack on one Windows laptop (two replicas, PostgreSQL 16, Redis 7, client
+on the same machine), 20% of requests streamed. Fake providers: no paid calls, so this measures the gateway, its
+database and Redis, not a provider. Raw results: [`results/load_test.json`](results/load_test.json).
+
+| Run | Clients | Requests | Throughput | Status codes | p50 / p95 / p99 latency (successful) |
+|---|---|---|---|---|---|
+| Baseline, one client | 1 | 24 in 22 s | 1.1/s | 24 × 200 | 815 / 1,985 / 2,646 ms |
+| Client limits off | 50 | 3,370 in 61 s | 55/s | 3,370 × 200 | 842 / 1,396 / 2,815 ms |
+| Shipped client limits (600/min) | 80 | 7,278 in 63 s | 116/s | 650 × 200, 6,628 × 429 | 1,498 / 4,047 / 5,232 ms |
+
+- Most of the latency is the fake provider's simulated delay: the median moved from 815 ms with one client to 842 ms
+  with 50. Throughput at 50 clients was bound by that delay, not by a gateway error; no request failed.
+- With the default limits, the busiest 60-second window in the request log held exactly 600 successful requests:
+  the per-client limit held across both replicas through Redis. The 429s carry `Retry-After`.
+- Every request was counted once by `/metrics` (`gateway_counted` equals `requests` in all three runs).
+- Not measured: real providers under load, the HTTPS proxy in the path, hosts other than this laptop.
+
 ### Provider comparison (measured 2026-11-15 to 2026-11-16)
 
 The same open-weight models on Groq and on OpenRouter (pinned to its DeepInfra bf16 host), on the 377 identical

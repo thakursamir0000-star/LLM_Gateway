@@ -1,0 +1,90 @@
+[
+  {
+    "ts": "2026-11-22T17:33:16+00:00",
+    "setup": {
+      "urls": [
+        "http://127.0.0.1:8000",
+        "http://127.0.0.1:8001"
+      ],
+      "concurrency": 50,
+      "duration_s": 60.0,
+      "stream_share": 0.2,
+      "note": "Docker Compose on one Windows laptop: 2 replicas, PostgreSQL 16, Redis 7, fake providers (no paid calls); client limits off for this key",
+      "client": "Windows 11, Python 3.13.7"
+    },
+    "requests": 3370,
+    "elapsed_s": 61.0,
+    "throughput_rps": 55.2,
+    "statuses": {
+      "200": 3370
+    },
+    "success_rate": 1.0,
+    "latency_ms_ok": {
+      "p50": 841.6,
+      "p95": 1396.3,
+      "p99": 2814.6,
+      "mean": 896.6,
+      "max": 6004.1
+    },
+    "gateway_counted": 3370
+  },
+  {
+    "ts": "2026-11-22T17:34:25+00:00",
+    "setup": {
+      "urls": [
+        "http://127.0.0.1:8000",
+        "http://127.0.0.1:8001"
+      ],
+      "concurrency": 80,
+      "duration_s": 60.0,
+      "stream_share": 0.2,
+      "note": "same stack; this key has the shipped default client limits (600/min, 50 in flight), shared by both replicas through Redis",
+      "client": "Windows 11, Python 3.13.7"
+    },
+    "requests": 7278,
+    "elapsed_s": 63.0,
+    "throughput_rps": 115.5,
+    "statuses": {
+      "200": 650,
+      "429": 6628
+    },
+    "success_rate": 0.0893,
+    "latency_ms_ok": {
+      "p50": 1497.6,
+      "p95": 4046.9,
+      "p99": 5232.3,
+      "mean": 1796.2,
+      "max": 6516.1
+    },
+    "gateway_counted": 7278
+  },
+  {
+    "ts": "2026-11-22T17:35:02+00:00",
+    "setup": {
+      "urls": [
+        "http://127.0.0.1:8000",
+        "http://127.0.0.1:8001"
+      ],
+      "concurrency": 1,
+      "duration_s": 20.0,
+      "stream_share": 0.2,
+      "note": "same stack, one client: baseline latency (mostly the fake provider's simulated delay)",
+      "client": "Windows 11, Python 3.13.7"
+    },
+    "requests": 24,
+    "elapsed_s": 21.9,
+    "throughput_rps": 1.1,
+    "statuses": {
+      "200": 24
+    },
+    "success_rate": 1.0,
+    "latency_ms_ok": {
+      "p50": 815.2,
+      "p95": 1984.9,
+      "p99": 2646.1,
+      "mean": 912.9,
+      "max": 2646.1
+    },
+    "gateway_counted": 24
+  }
+]
