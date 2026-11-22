@@ -36,6 +36,7 @@ BASE_CONFIG: dict[str, Any] = {
     # Isolated test compatibility settings: tests assert gateway internal metadata.
     "auth": {
         "keys_env": "TEST_GATEWAY_KEYS",
+        "keys_file_env": "TEST_GATEWAY_KEYS_FILE",
         "admin_key_env": "TEST_GATEWAY_ADMIN_KEY",
         "allow_anonymous": True,
     },

@@ -177,6 +177,7 @@ class AlertConfig(_Strict):
 
 class AuthConfig(_Strict):
     keys_env: str = "GATEWAY_API_KEYS"
+    keys_file_env: str = "GATEWAY_API_KEYS_FILE"
     admin_key_env: str = "GATEWAY_ADMIN_KEY"
     allow_anonymous: bool = False
 

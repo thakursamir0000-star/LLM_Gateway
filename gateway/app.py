@@ -8,6 +8,7 @@ gateway by changing its base URL to ``http://<host>:8000/v1``.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import hmac
 import math
 import os
@@ -41,13 +42,40 @@ _APP_ID = re.compile(r"[A-Za-z0-9._-]{1,64}")
 
 
 def parse_api_keys(raw: str) -> dict[str, str]:
-    """``"app1:key1,app2:key2"`` -> {key: app}."""
+    """``"app1:key1,app2:sha256:<hex>"`` -> {key or "sha256:<hex>": app}.
+
+    Entries are separated by commas or newlines; lines starting with ``#`` are comments. A key given as
+    ``sha256:<64 hex digits>`` is the SHA-256 of the real key, so the secret store never holds a usable key. An app
+    may have several keys at once, which is how keys are rotated without downtime (see SECURITY.md).
+    """
     keys = {}
-    for item in raw.split(","):
-        app_id, sep, key = item.strip().partition(":")
-        if sep and app_id.strip() and key.strip():
-            keys[key.strip()] = app_id.strip()
+    for line in raw.splitlines():
+        if line.strip().startswith("#"):
+            continue
+        for item in line.split(","):
+            app_id, sep, key = item.strip().partition(":")
+            key = key.strip()
+            if key.lower().startswith("sha256:"):
+                key = key.lower()
+            if sep and app_id.strip() and key:
+                keys[key] = app_id.strip()
     return keys
+
+
+def load_api_keys(config: GatewayConfig) -> dict[str, str]:
+    """Client keys from $GATEWAY_API_KEYS and the file named by $GATEWAY_API_KEYS_FILE (a mounted secret)."""
+    raw = os.environ.get(config.auth.keys_env, "")
+    path = os.environ.get(config.auth.keys_file_env, "").strip()
+    if path:
+        raw += "\n" + Path(path).read_text(encoding="utf-8")
+    return parse_api_keys(raw)
+
+
+def key_matches(token: str, key: str) -> bool:
+    """Constant-time check of a presented token against a plain or ``sha256:`` key."""
+    if key.startswith("sha256:"):
+        return hmac.compare_digest("sha256:" + hashlib.sha256(token.encode()).hexdigest(), key)
+    return hmac.compare_digest(token, key)
 
 
 def _truthy(value: str | None) -> bool:
@@ -60,9 +88,9 @@ def _enforce_production_guards(config: GatewayConfig) -> None:
         raise RuntimeError("Production requires PostgreSQL database (GATEWAY_DATABASE_URL), SQLite is forbidden.")
     if config.auth.allow_anonymous:
         raise RuntimeError("Production cannot permit anonymous access (GATEWAY_ALLOW_ANONYMOUS=0 required).")
-    keys_raw = os.environ.get(config.auth.keys_env, "").strip()
-    if not keys_raw:
-        raise RuntimeError(f"Production requires client API keys configured via {config.auth.keys_env}.")
+    if not load_api_keys(config):
+        raise RuntimeError(f"Production requires client API keys configured via {config.auth.keys_env} "
+                           f"or {config.auth.keys_file_env}.")
     admin_key = os.environ.get(config.auth.admin_key_env, "").strip()
     if not admin_key:
         raise RuntimeError(f"Production requires admin key configured via {config.auth.admin_key_env}.")
@@ -111,7 +139,7 @@ def create_app(config: GatewayConfig | None = None, *, providers: dict[str, Prov
     releases = ReleaseManager(config, store)
     gateway = Gateway(config, registry, store, router, releases, BudgetPolicy(config.budgets),
                       AlertMonitor(store, config.alerts, notify, clock), rng=rng, clock=clock)
-    api_keys = parse_api_keys(os.environ.get(config.auth.keys_env, ""))
+    api_keys = load_api_keys(config)
     admin_key = os.environ.get(config.auth.admin_key_env) or None
     metrics_token = os.environ.get("GATEWAY_METRICS_TOKEN") or None
 
@@ -201,9 +229,13 @@ def create_app(config: GatewayConfig | None = None, *, providers: dict[str, Prov
         if api_keys:
             header = request.headers.get("authorization", "")
             token = header[7:].strip() if header.lower().startswith("bearer ") else ""
-            for key, app_id in api_keys.items():
-                if token and hmac.compare_digest(token, key):
-                    return app_id
+            if token:
+                matched = None
+                for key, app_id in api_keys.items():  # check every key: the time doesn't reveal which matched
+                    if key_matches(token, key) and matched is None:
+                        matched = app_id
+                if matched is not None:
+                    return matched
             raise GatewayError(401, "invalid or missing API key", code="invalid_api_key", counts_as_error=False)
 
         if not config.auth.allow_anonymous:
@@ -216,7 +248,7 @@ def create_app(config: GatewayConfig | None = None, *, providers: dict[str, Prov
         if admin_key is None:
             raise GatewayError(403, f"admin endpoints are off: set {config.auth.admin_key_env} to enable them",
                                code="admin_disabled")
-        if not hmac.compare_digest(request.headers.get("x-admin-key", ""), admin_key):
+        if not key_matches(request.headers.get("x-admin-key", ""), admin_key):
             raise GatewayError(401, "invalid admin key", code="invalid_admin_key")
 
     def threshold_for(request: Request) -> float | None:

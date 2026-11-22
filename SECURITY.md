@@ -5,6 +5,20 @@
 Please report security problems privately to the repository owner (GitHub security advisories), not in a public
 issue. Include the affected version or commit and how to reproduce it.
 
+## Keys and secrets
+
+- **Client keys**: `GATEWAY_API_KEYS` and/or the file named by `GATEWAY_API_KEYS_FILE` (a mounted secret), one
+  `app:key` entry per line or comma. Store keys hashed: `python scripts/make_api_key.py <app> --append <file>`
+  writes `app:sha256:<hex>` and prints the key once for the client; the gateway compares SHA-256 digests in
+  constant time, so a leaked keys file holds no usable key.
+- **Rotation without downtime**: add the new entry next to the old one, restart the replicas one at a time, move the
+  client to the new key, delete the old entry and restart again. A revoked key gets 401 on the next restart.
+- **Admin key**: `GATEWAY_ADMIN_KEY` may also be given as `sha256:<hex>` (lower case). The admin API is never
+  published by the HTTPS proxy.
+- **Provider keys** (`GROQ_API_KEY`, `OPENROUTER_API_KEY`, `GEMINI_API_KEY`), the database password, the Grafana
+  password and the metrics token belong in the deployment's secret store, never in the repository; `.env` is
+  git-ignored. Rotate a provider key at the provider, update the secret, then restart the replicas one at a time.
+
 ## Dependencies (supply chain)
 
 - **Inputs and locks.** `requirements.txt` (the service), `requirements-dev.txt` (tests and tools) and

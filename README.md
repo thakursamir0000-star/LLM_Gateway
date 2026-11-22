@@ -358,6 +358,8 @@ Phase 1 security hardening enforces production-safe defaults:
   - *Client Migration*: Any client calling the gateway must supply `Authorization: Bearer <key>`. For local development
     or offline demos where anonymous access via `X-App-Id` is desired, explicitly set `GATEWAY_ALLOW_ANONYMOUS=1` or
     `auth.allow_anonymous: true` in the configuration.
+  - *Key storage and rotation*: keys may be stored as `app:sha256:<hex>` (from `scripts/make_api_key.py`) and read
+    from a mounted file (`GATEWAY_API_KEYS_FILE`); an app may hold several keys while it rotates (see SECURITY.md).
 - **Internal Metadata Protection**: By default (`security.expose_internal_metadata: false`), response payloads contain
   standard OpenAI-compatible fields (`id`, `object`, `created`, `model`, `choices`, `usage`). The custom `gateway`
   diagnostic dictionary and internal headers (`x-gateway-model`, `x-gateway-tier`, `x-gateway-release`,
