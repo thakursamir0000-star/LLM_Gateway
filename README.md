@@ -45,7 +45,8 @@ See [Validation status](#validation-status).
 | Redis shared state and outage policy | yes | yes | yes: real Redis 7, outage drill | – | no |
 | Authentication, admin key, body limits, CORS, generic upstream errors | yes | yes | yes: 401 without a key in the Docker smoke test | – | no |
 | Locked, hash-checked dependencies; digest-pinned base image; vulnerability audit | yes | – | yes: CI installs the locks, audit workflow on every push and weekly | – | – |
-| Prometheus metrics, HTTPS entry point, per-client rate limits, backups | **no** | – | – | – | – |
+| HTTPS proxy (TLS 1.2/1.3, redirect, security headers), dashboard password, admin API not published | yes | yes (password hashing) | yes: two-replica Docker check | – | no |
+| Prometheus metrics, per-client rate limits, backups | **no** | – | – | – | – |
 
 "Integration tested" means against real PostgreSQL, Redis or Docker Compose (`tests/test_postgres_integration.py`,
 `tests/test_redis_*.py`, `scripts/redis_outage_drill.py`, `scripts/multi_instance_check.py`).
@@ -171,16 +172,23 @@ docker compose up --build
 `WITH_EMBEDDINGS=true docker compose up --build` adds sentence-transformers (CPU torch) so the trained router can run
 in the container; without it the gateway uses the rule-based router.
 
-The dashboard is available locally at `http://127.0.0.1:8501`. It displays app IDs, model and release information,
-costs, and error details, and it does not have built-in authentication. Docker Compose therefore publishes it only on
-`127.0.0.1`. For remote administration, keep that binding and use an SSH tunnel:
+The dashboard shows app IDs, model and release information, costs and error details, and has no login of its own.
+Docker Compose publishes it on `http://127.0.0.1:8501/dashboard/` only. Remote access goes through the HTTPS proxy
+(`--profile proxy`), which serves it at `https://<host>/dashboard/` behind a password; or keep the loopback binding and
+use an SSH tunnel (`ssh -L 8501:127.0.0.1:8501 user@gateway-host`).
+
+**HTTPS proxy** (`docker compose --profile proxy up -d`): nginx terminates TLS 1.2/1.3 on port 443 in front of both
+replicas and the dashboard; port 80 only redirects to HTTPS. It reads `server.crt`, `server.key` and
+`dashboard.htpasswd` from `GATEWAY_TLS_DIR` (default `config/tls/`, git-ignored). For local use create them with:
 
 ```bash
-ssh -L 8501:127.0.0.1:8501 user@gateway-host
+python scripts/make_proxy_secrets.py    # self-signed localhost certificate; set DASHBOARD_PASSWORD or one is generated
 ```
 
-Then open `http://127.0.0.1:8501` on the administrator's computer. An authenticated reverse proxy is also suitable
-when managed remote access is required.
+In production put a certificate from a real CA in that directory. The proxy adds HSTS, `X-Content-Type-Options`,
+`X-Frame-Options`, `Referrer-Policy` and `frame-ancestors 'none'`, refuses `/admin/` (use the gateway's loopback port
+with `X-Admin-Key`, or the CLI) and asks for the dashboard password. The gateway ports themselves are published on
+`127.0.0.1` only.
 
 ## Routing
 
@@ -634,10 +642,11 @@ Services provided:
 - `postgres`: PostgreSQL 16 on `127.0.0.1:54320` (container port 5432) with persistent volume `postgres-data`.
 - `redis`: Redis 7 on `127.0.0.1:63790` (container port 6379) with `noeviction` policy.
 - `migrations`: One-shot container that upgrades schema to `head` before gateways start.
-- `gateway`: Primary gateway replica on port `8000`.
-- `gateway-replica`: Second gateway replica on port `8001`.
-- `dashboard`: Streamlit dashboard on `127.0.0.1:8501`.
-- `proxy` (profile `proxy`): nginx on port 80, round-robin over both replicas, response buffering off for SSE.
+- `gateway`: Primary gateway replica on `127.0.0.1:8000`.
+- `gateway-replica`: Second gateway replica on `127.0.0.1:8001`.
+- `dashboard`: Streamlit dashboard on `127.0.0.1:8501/dashboard/`.
+- `proxy` (profile `proxy`): nginx with HTTPS on port 443 (port 80 redirects), round-robin over both replicas,
+  response buffering off for SSE, `/admin/` blocked, the dashboard behind a password.
 
 **Two-replica validation.** `python scripts/multi_instance_check.py` builds the image, starts this stack under its
 own Compose project (`llmgw-mi`) with fake providers, and checks that both replicas share one daily budget, one
@@ -733,8 +742,8 @@ tests/              pytest suite
 Not met by the repository alone: provide them before exposing the gateway.
 
 - `GATEWAY_ENV=production` with PostgreSQL, Redis (`noeviction`), client keys and an admin key; start-up refuses less.
-- An HTTPS entry point: the bundled nginx `proxy` profile listens on plain HTTP and is for local load balancing.
-- The dashboard has no login: keep it on loopback or behind an authenticating proxy.
+- A certificate from a real CA for the nginx `proxy` (the bundled script makes self-signed development ones), and a
+  strong dashboard password (`DASHBOARD_PASSWORD`).
 - Backups of PostgreSQL and a retention policy for the request log (none are automated yet).
 - Monitoring beyond `/health`, `/ready` and the dashboard (no Prometheus endpoint yet).
 
@@ -742,7 +751,7 @@ Not met by the repository alone: provide them before exposing the gateway.
 
 - Real providers through the gateway's HTTP API are verified by one smoke run (`scripts/real_provider_smoke.py`, four
   requests); the test suite itself uses fake providers or mocked HTTP. Gemini has not been called for real.
-- Nothing is deployed. There is no HTTPS entry point, no Prometheus metrics, no per-client rate limit (only daily
+- Nothing is deployed. There are no Prometheus metrics, no per-client rate limit (only daily
   budgets) and no automated backup or retention.
 - Redis is used through a synchronous client, so each Redis call briefly blocks the event loop.
 - The trained classifier is evaluated (see [Results](#results)) but not shipped: `models/router.json` is not

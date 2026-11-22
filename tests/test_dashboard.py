@@ -20,10 +20,13 @@ def test_dashboard_deployment_is_loopback_only_and_keeps_local_healthcheck():
 
     assert dashboard["ports"] == ["127.0.0.1:8501:8501"]
     assert "--server.address=0.0.0.0" in dashboard["command"]
-    assert "http://127.0.0.1:8501/_stcore/health" in " ".join(dashboard["healthcheck"]["test"])
+    assert "--server.baseUrlPath=dashboard" in dashboard["command"]  # served under /dashboard/, also by the proxy
+    assert "http://127.0.0.1:8501/dashboard/_stcore/health" in " ".join(dashboard["healthcheck"]["test"])
 
-    # C2 changes dashboard exposure only. The gateway's existing host mapping remains unchanged.
-    assert compose["services"]["gateway"]["ports"] == ["8000:8000"]
+    # The gateway replicas are published on loopback only: external traffic goes through the HTTPS proxy.
+    assert compose["services"]["gateway"]["ports"] == ["127.0.0.1:8000:8000"]
+    assert compose["services"]["gateway-replica"]["ports"] == ["127.0.0.1:8001:8001"]
+    assert compose["services"]["proxy"]["ports"] == ["80:80", "443:443"]
 
     ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
     assert "-p 127.0.0.1:8501:8501" in ci
