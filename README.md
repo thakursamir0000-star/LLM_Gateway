@@ -54,6 +54,34 @@ See [Validation status](#validation-status).
 "Integration tested" means against real PostgreSQL, Redis or Docker Compose (`tests/test_postgres_integration.py`,
 `tests/test_redis_*.py`, `scripts/redis_outage_drill.py`, `scripts/multi_instance_check.py`).
 
+### Final end-to-end run (2026-11-22, this laptop, fake providers)
+
+The merged code was run as a production-style stack: Docker Compose with `GATEWAY_ENV=production` (start-up guards
+on), two replicas, PostgreSQL 16, Redis 7, the HTTPS proxy with a development certificate, Prometheus and Grafana;
+client keys stored hashed in a mounted keys file, a hashed admin key, a metrics token given to Prometheus as
+[docs/RUNBOOK.md](docs/RUNBOOK.md) describes. Fake providers, so no paid calls; nothing was published beyond
+this machine, and the stack was removed afterwards.
+
+| Check | Result |
+|---|---|
+| `scripts/multi_instance_check.py` (shared budget, rate limit, cooldown and breaker, HTTPS, SSE through the proxy, replica restart, bounded connections) | all 8 checks passed |
+| Start-up in production mode; `/health` through HTTPS | every service healthy; `"auth": "api_keys"`, rule-based router (no classifier installed) |
+| Chat through the proxy with a hashed key; wrong key | 6 × 200; 401 |
+| Streaming through the proxy | 7 `data:` events ending in `[DONE]` |
+| Admin API: through the proxy; on loopback with the hashed admin key; wrong key | 403; 200; 401 |
+| `/metrics`: through the proxy; loopback without the token; with it | 403; 401; 200 |
+| Dashboard without / with its password | 401; 200 |
+| Client limit, `demo` app (60 per minute), 65 requests | 60 × 200, 5 × 429 |
+| Prometheus | both replicas `up` with the token; counted 68 ok and 5 rejected, matching what was sent; no alerts firing |
+| Grafana | "LLM Gateway" dashboard provisioned; admin/admin refused |
+| JSON access logs | one line per request; none contains prompt text |
+| Redis stopped under load (`fail_closed`) | both replicas `/ready` 503; requests 429 `client_rate_limited` with `Retry-After: 5`; Prometheus recorded `gateway_state_degraded` = 1 on both |
+| Redis restarted | both replicas ready and answering within 1 s |
+| Backup drill (`scripts/db_backup.py drill`) | 76 requests and 69 calls restored identically, Alembic revision `0004_shadow_routing` |
+| Retention dry run | ran on PostgreSQL; nothing older than 90 days |
+
+Not covered: real providers under load, a public host and real certificate, Gemini, the trained router (kept off).
+
 ## What it does
 
 - **OpenAI-compatible API**: `POST /v1/chat/completions` (with `stream: true`), `GET /v1/models`, plus
@@ -431,7 +459,8 @@ Phase 1 security hardening enforces production-safe defaults:
   live database; overwriting the live one also needs `--overwrite-live`.
 - **Drill**: `python scripts/db_backup.py drill` backs up, restores into a scratch database, compares the row
   count of every table and the Alembic revision, and drops the scratch database. Run it after every schema change
-  and on a schedule; it passed on the Compose PostgreSQL 16 database (5 requests, revision 0003).
+  and on a schedule; it passed on the Compose PostgreSQL 16 database at revision 0003 (5 requests) and again at 0004 in the final
+  end-to-end run (76 requests).
 
 ## Router shadow mode and controlled activation
 
@@ -851,6 +880,8 @@ Not met by the repository alone: provide them before exposing the gateway.
 
 ## Limitations and next steps
 
+- An unauthenticated request with an invalid body gets the 400 validation error before the 401: FastAPI checks the
+  body before the route runs. It reveals only the public request schema; a valid body without a key gets 401.
 - Real providers through the gateway's HTTP API are verified by one smoke run (`scripts/real_provider_smoke.py`, four
   requests); the test suite itself uses fake providers or mocked HTTP. Gemini has not been called for real.
 - Nothing is deployed. Retention and backups are commands to schedule; nothing schedules them yet.
