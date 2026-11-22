@@ -32,10 +32,13 @@ from typing import Any
 
 import httpx
 
+from gateway import __version__
 from gateway.config import GatewayConfig, Release
+from gateway.logs import log_access
 from gateway.manage.budgets import BudgetPolicy, reservation_estimate, seconds_until_utc_midnight
 from gateway.manage.releases import ReleaseManager
 from gateway.monitoring.alerts import AlertMonitor
+from gateway.monitoring.prometheus import Metrics
 from gateway.monitoring.store import CallRecord, RequestRecord, Store, iso, utc_now
 from gateway.providers import ModelRegistry
 from gateway.providers.base import (
@@ -193,6 +196,7 @@ class Gateway:
         self.alerts = alerts
         self.rng = rng or random.Random()
         self.clock = clock
+        self.metrics = Metrics(__version__)
 
     def resolve_mode(self, requested: str) -> tuple[str, str | None]:
         """(mode, pinned model alias) for the request's ``model`` field."""
@@ -809,6 +813,11 @@ class Gateway:
         except Exception:
             log.exception("could not log request %s (status %s, http %s, error %s, cost $%.8f)", record.id,
                           record.status, record.http_status, record.error_type, record.cost_usd)
+        try:
+            self.metrics.observe(record)
+            log_access(record)
+        except Exception:
+            log.exception("could not record metrics for request %s", record.id)
         if self.alerts is not None:
             try:
                 await asyncio.to_thread(self.alerts.maybe_check)

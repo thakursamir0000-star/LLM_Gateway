@@ -64,6 +64,7 @@ services:
       GATEWAY_REDIS_URL: redis://redis:6379/0
       GATEWAY_HOST: 0.0.0.0
       GATEWAY_PORT: 8000
+      GATEWAY_LOG_FORMAT: json
     ports:
       - "127.0.0.1:8000:8000"  # loopback only: external traffic goes through the HTTPS proxy
     depends_on:
@@ -92,6 +93,7 @@ services:
       GATEWAY_REDIS_URL: redis://redis:6379/0
       GATEWAY_HOST: 0.0.0.0
       GATEWAY_PORT: 8001
+      GATEWAY_LOG_FORMAT: json
     ports:
       - "127.0.0.1:8001:8001"
     depends_on:
@@ -154,5 +156,43 @@ services:
       retries: 3
     restart: unless-stopped
 
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    profiles:
+      - monitoring
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.retention.time=15d"]
+    volumes:
+      - ./config/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./config/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "127.0.0.1:9090:9090"
+    depends_on:
+      gateway:
+        condition: service_healthy
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    profiles:
+      - monitoring
+    # Refuses to start without GRAFANA_ADMIN_PASSWORD, rather than with Grafana's default admin/admin.
+    entrypoint: ["sh", "-c", "test -n \"$$GF_SECURITY_ADMIN_PASSWORD\" || { echo 'set GRAFANA_ADMIN_PASSWORD in .env' >&2; exit 1; }; exec /run.sh"]
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+    volumes:
+      - ./config/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./config/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
 volumes:
   postgres-data:
+  prometheus-data:
+  grafana-data:

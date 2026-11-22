@@ -47,7 +47,8 @@ See [Validation status](#validation-status).
 | Locked, hash-checked dependencies; digest-pinned base image; vulnerability audit | yes | – | yes: CI installs the locks, audit workflow on every push and weekly | – | – |
 | HTTPS proxy (TLS 1.2/1.3, redirect, security headers), dashboard password, admin API not published | yes | yes (password hashing) | yes: two-replica Docker check | – | no |
 | Per-client request limits (requests per minute, requests in flight) | yes | yes | yes: real Redis 7, two backends sharing one allowance | – | no |
-| Prometheus metrics, backups | **no** | – | – | – | – |
+| Prometheus metrics, JSON access logs, Grafana dashboard, alert rules | yes | yes | – | – | no |
+| Backups | **no** | – | – | – | – |
 
 "Integration tested" means against real PostgreSQL, Redis or Docker Compose (`tests/test_postgres_integration.py`,
 `tests/test_redis_*.py`, `scripts/redis_outage_drill.py`, `scripts/multi_instance_check.py`).
@@ -395,6 +396,23 @@ Phase 1 security hardening enforces production-safe defaults:
 - **Alerts**: error rate over the last `window_minutes` (with at least `min_requests`) above `alerts.error_rate`, or
   today's cost above `alerts.daily_cost_usd`. Each alert is logged, stored (the dashboard shows it), and POSTed as JSON
   to `ALERT_WEBHOOK_URL` when set; it fires at most once per window (error rate) or per day (cost).
+
+## Metrics and logs
+
+- **`GET /metrics`** (Prometheus text format, per replica): `gateway_requests_total{app,status,tier,error_type,stream}`,
+  `gateway_request_duration_seconds` (histogram), `gateway_tokens_total{app,model,kind}`,
+  `gateway_cost_usd_total{app,model}`, `gateway_provider_calls_total{model,status,error_type}`,
+  `gateway_provider_call_duration_seconds`, `gateway_fallbacks_total`, `gateway_escalations_total`,
+  `gateway_state_degraded` and `gateway_build_info`. Every finished request is counted once, from the same record
+  the request log stores. Labels never hold prompt text, keys or provider messages; at most 100 distinct app ids
+  are kept, later ones count as `other`. The HTTPS proxy answers 403 for `/metrics`; set `GATEWAY_METRICS_TOKEN`
+  to require `Authorization: Bearer <token>` from scrapers as well.
+- **Logs**: `GATEWAY_LOG_FORMAT=json` (set in Compose) writes one JSON object per line, and one `gateway.access`
+  line per request (id, app, outcome, model, tokens, cost, latency; no content).
+- **Prometheus and Grafana**: `docker compose --profile monitoring up -d` adds Prometheus (`127.0.0.1:9090`,
+  scraping both replicas, alert rules in `config/prometheus/alerts.yml`: error rate, Redis degraded, replica down,
+  slow p95) and Grafana (`127.0.0.1:3000`, admin password from `GRAFANA_ADMIN_PASSWORD`, the provisioned "LLM
+  Gateway" dashboard). Routing the alerts to a pager needs an Alertmanager, which is not included.
 
 ## Router lab: data, training, evaluation
 
@@ -756,13 +774,13 @@ Not met by the repository alone: provide them before exposing the gateway.
 - A certificate from a real CA for the nginx `proxy` (the bundled script makes self-signed development ones), and a
   strong dashboard password (`DASHBOARD_PASSWORD`).
 - Backups of PostgreSQL and a retention policy for the request log (none are automated yet).
-- Monitoring beyond `/health`, `/ready` and the dashboard (no Prometheus endpoint yet).
+- An Alertmanager (or another receiver) for the Prometheus alert rules, and Grafana behind your SSO or VPN.
 
 ## Limitations and next steps
 
 - Real providers through the gateway's HTTP API are verified by one smoke run (`scripts/real_provider_smoke.py`, four
   requests); the test suite itself uses fake providers or mocked HTTP. Gemini has not been called for real.
-- Nothing is deployed. There are no Prometheus metrics and no automated backup or retention.
+- Nothing is deployed. There is no automated backup or retention.
 - Redis is used through a synchronous client whose calls run in worker threads (never on the event loop); each
   call still holds a thread for one round trip, which bounds Redis throughput by the thread pool.
 - The trained classifier is evaluated (see [Results](#results)) but not shipped: `models/router.json` is not

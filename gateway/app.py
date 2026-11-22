@@ -21,7 +21,7 @@ from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from gateway import __version__
@@ -30,6 +30,7 @@ from gateway.manage.budgets import BudgetPolicy
 from gateway.manage.releases import ReleaseError, ReleaseManager
 from gateway.monitoring import metrics
 from gateway.monitoring.alerts import Alert, AlertMonitor, log_notifier, webhook_notifier
+from gateway.monitoring.prometheus import CONTENT_TYPE as METRICS_CONTENT_TYPE
 from gateway.monitoring.store import Store, iso, utc_now
 from gateway.providers import ModelRegistry, Provider, build_providers
 from gateway.routing import Router, build_router
@@ -112,6 +113,7 @@ def create_app(config: GatewayConfig | None = None, *, providers: dict[str, Prov
                       AlertMonitor(store, config.alerts, notify, clock), rng=rng, clock=clock)
     api_keys = parse_api_keys(os.environ.get(config.auth.keys_env, ""))
     admin_key = os.environ.get(config.auth.admin_key_env) or None
+    metrics_token = os.environ.get("GATEWAY_METRICS_TOKEN") or None
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -315,6 +317,17 @@ def create_app(config: GatewayConfig | None = None, *, providers: dict[str, Prov
                               else {"backend": "memory", "ready": True}),
         }
         return JSONResponse(data, status_code=status_code)
+
+    @app.get("/metrics", include_in_schema=False)
+    async def prometheus_metrics(request: Request) -> PlainTextResponse:
+        # Prometheus scrape endpoint for this replica. The HTTPS proxy doesn't publish it; with
+        # GATEWAY_METRICS_TOKEN set, scrapes must also send "Authorization: Bearer <token>".
+        if metrics_token is not None:
+            sent = request.headers.get("authorization", "")
+            if not hmac.compare_digest(sent, f"Bearer {metrics_token}"):
+                raise GatewayError(401, "invalid metrics token", code="invalid_metrics_token")
+        state_status = await asyncio.to_thread(registry.state.status) if hasattr(registry, "state") else None
+        return PlainTextResponse(gateway.metrics.render(state_status), media_type=METRICS_CONTENT_TYPE)
 
     # ── admin ───────────────────────────────────────────────────────
     async def deployment_view() -> dict[str, Any]:
