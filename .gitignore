@@ -40,3 +40,6 @@ Thumbs.db
 
 # Lock held by a running label collection
 router_data/*.lock
+
+# Proxy TLS certificates and the dashboard password file (scripts/make_proxy_secrets.py)
+config/tls/

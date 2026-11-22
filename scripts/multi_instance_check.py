@@ -15,7 +15,9 @@ Checks (printed as JSON; exit 1 if any fails):
   across both replicas overshoots by at most one request;
 - one Redis rate limit: a model limited to 4 requests/minute gets at most 4 calls across both replicas;
 - one provider cooldown and one circuit breaker: state written to Redis is honoured by both replicas;
-- SSE streaming through the proxy delivers several chunks and [DONE];
+- the HTTPS proxy: HTTP redirects to HTTPS, TLS 1.2/1.3 only, security headers, /admin/ blocked, the dashboard
+  needs its password, and the gateway ports are published on loopback only;
+- SSE streaming through the HTTPS proxy delivers several chunks and [DONE];
 - a restarted replica comes back ready with the shared state intact;
 - PostgreSQL connections stay bounded.
 """
@@ -25,7 +27,10 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import json
+import os
 import secrets
+import socket
+import ssl
 import subprocess
 import sys
 import time
@@ -35,10 +40,17 @@ import httpx
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from scripts.make_proxy_secrets import make_secrets  # noqa: E402
+
 WORK = ROOT / "var" / "multi-instance"
 PROJECT = "llmgw-mi"
 REPLICAS = {"gateway": "http://127.0.0.1:8000", "gateway-replica": "http://127.0.0.1:8001"}
-PROXY = "http://127.0.0.1:80"
+PROXY = "https://127.0.0.1"
+PROXY_HTTP = "http://127.0.0.1"
+TLS_DIR = WORK / "tls"
+CERT = str(TLS_DIR / "server.crt")  # self-signed: trusted as its own CA
 LIMITED_MODEL = "gpt-oss-120b"  # 4 requests per minute in the test config
 BUDGET_MODEL = "gpt-oss-20b"
 COOLDOWN_MODEL = "or-gpt-oss-20b"
@@ -48,7 +60,9 @@ BREAKER_MODEL, BREAKER_PROVIDER = "gemma-4-31b", "gemini"
 def compose(*args: str, check: bool = True) -> str:
     command = ["docker", "compose", "-p", PROJECT, "-f", str(ROOT / "docker-compose.yml"),
                "-f", str(WORK / "compose.override.yml"), "--profile", "proxy", *args]
-    result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    env = {**os.environ, "GATEWAY_TLS_DIR": TLS_DIR.as_posix()}
+    result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                            env=env)
     if check and result.returncode != 0:
         raise RuntimeError(f"docker compose {' '.join(args)} failed:\n{result.stdout}\n{result.stderr}")
     return result.stdout.strip()
@@ -62,7 +76,7 @@ def redis(*args: str) -> str:
     return compose("exec", "-T", "redis", "redis-cli", *args)
 
 
-def write_test_setup(keys: dict[str, str]) -> None:
+def write_test_setup(keys: dict[str, str], admin_key: str, dashboard_password: str) -> None:
     config = yaml.safe_load((ROOT / "config" / "gateway.yaml").read_text(encoding="utf-8"))
     for name, model in config["models"].items():  # only the rate-limit test model is limited
         model["limits"] = {"rpm": 4, "tpm": 0} if name == LIMITED_MODEL else {"rpm": 0, "tpm": 0}
@@ -72,19 +86,22 @@ def write_test_setup(keys: dict[str, str]) -> None:
     (WORK / "gateway.yaml").write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
     environment = {"GATEWAY_FAKE_PROVIDERS": "1", "GATEWAY_FAKE_PACING": "1",
                    "GATEWAY_CONFIG": "/app/test-config/gateway.yaml",
+                   "GATEWAY_ADMIN_KEY": admin_key,
                    "GATEWAY_API_KEYS": ",".join(f"{app}:{key}" for app, key in keys.items())}
     service = {"environment": environment,
                "volumes": [{"type": "bind", "source": (WORK / "gateway.yaml").as_posix(),
                             "target": "/app/test-config/gateway.yaml", "read_only": True}]}
     override = {"services": {"gateway": service, "gateway-replica": service}}
     (WORK / "compose.override.yml").write_text(yaml.safe_dump(override, sort_keys=False), encoding="utf-8")
+    make_secrets(TLS_DIR, "admin", dashboard_password, days=2)
 
 
 def wait_ready(url: str, timeout: float = 120.0) -> bool:
+    verify = CERT if url.startswith("https") else True
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
-            if httpx.get(f"{url}/ready", timeout=3).status_code == 200:
+            if httpx.get(f"{url}/ready", timeout=3, verify=verify).status_code == 200:
                 return True
         except httpx.HTTPError:
             pass
@@ -148,7 +165,7 @@ def check_cooldown_and_breaker(keys: dict[str, str]) -> dict:
 
 def check_proxy_stream(keys: dict[str, str]) -> dict:
     events: list[str] = []
-    with httpx.stream("POST", f"{PROXY}/v1/chat/completions", timeout=30,
+    with httpx.stream("POST", f"{PROXY}/v1/chat/completions", timeout=30, verify=CERT,
                       headers={"Authorization": f"Bearer {keys['mi-stream']}"},
                       json={"model": BUDGET_MODEL, "stream": True,
                             "messages": [{"role": "user", "content": "stream a few words please"}]}) as response:
@@ -159,6 +176,51 @@ def check_proxy_stream(keys: dict[str, str]) -> dict:
     return {"status": status, "content_type": content_type, "chunks": len(chunks), "last": events[-1] if events else None,
             "ok": status == 200 and content_type.startswith("text/event-stream") and len(chunks) >= 2
             and events[-1] == "[DONE]"}
+
+
+def tls_version(maximum: ssl.TLSVersion, minimum: ssl.TLSVersion | None = None) -> str:
+    """The protocol the proxy negotiates for a client limited to ``maximum``, or why the handshake failed."""
+    context = ssl.create_default_context(cafile=CERT)
+    if minimum is not None:
+        context.set_ciphers("DEFAULT:@SECLEVEL=0")  # let this client offer an old protocol at all
+        context.minimum_version = minimum
+    context.maximum_version = maximum
+    try:
+        with socket.create_connection(("127.0.0.1", 443), timeout=5) as raw,                 context.wrap_socket(raw, server_hostname="127.0.0.1") as tls:
+            return tls.version() or "unknown"
+    except (ssl.SSLError, OSError) as error:
+        return f"refused ({type(error).__name__})"
+
+
+def check_https(keys: dict[str, str], admin_key: str, dashboard_password: str) -> dict:
+    redirect = httpx.get(f"{PROXY_HTTP}/v1/models", follow_redirects=False, timeout=10)
+    api = httpx.get(f"{PROXY}/v1/models", verify=CERT, timeout=10)
+    headers = {name: api.headers.get(name) for name in ("strict-transport-security", "x-content-type-options",
+                                                          "x-frame-options", "referrer-policy")}
+    admin_via_proxy = httpx.get(f"{PROXY}/admin/status", headers={"X-Admin-Key": admin_key}, verify=CERT, timeout=10)
+    admin_on_loopback = httpx.get(f"{REPLICAS['gateway']}/admin/status", headers={"X-Admin-Key": admin_key}, timeout=10)
+    dashboard_anonymous = httpx.get(f"{PROXY}/dashboard/", verify=CERT, timeout=10)
+    dashboard_wrong = httpx.get(f"{PROXY}/dashboard/", auth=("admin", "wrong-password"), verify=CERT, timeout=10)
+    dashboard_ok = httpx.get(f"{PROXY}/dashboard/", auth=("admin", dashboard_password), verify=CERT, timeout=30)
+    ports = {name: compose("port", name, port) for name, port in (("gateway", "8000"), ("gateway-replica", "8001"))}
+    protocols = {"default": tls_version(ssl.TLSVersion.TLSv1_3), "max_tls1.2": tls_version(ssl.TLSVersion.TLSv1_2),
+                 "max_tls1.1": tls_version(ssl.TLSVersion.TLSv1_1, ssl.TLSVersion.TLSv1)}
+    report = {
+        "http_redirect": [redirect.status_code, redirect.headers.get("location")], "headers": headers,
+        "admin_via_proxy": admin_via_proxy.status_code, "admin_on_loopback": admin_on_loopback.status_code,
+        "dashboard": {"no_password": dashboard_anonymous.status_code, "wrong_password": dashboard_wrong.status_code,
+                      "right_password": dashboard_ok.status_code},
+        "published_ports": ports, "tls": protocols,
+    }
+    report["ok"] = (redirect.status_code == 301 and (redirect.headers.get("location") or "").startswith("https://")
+                    and api.status_code == 200 and all(headers.values())
+                    and admin_via_proxy.status_code == 403 and admin_on_loopback.status_code == 200
+                    and (dashboard_anonymous.status_code, dashboard_wrong.status_code, dashboard_ok.status_code)
+                    == (401, 401, 200)
+                    and all(port.startswith("127.0.0.1:") for port in ports.values())
+                    and protocols["default"] == "TLSv1.3" and protocols["max_tls1.2"] == "TLSv1.2"
+                    and protocols["max_tls1.1"].startswith("refused"))
+    return report
 
 
 def check_restart(keys: dict[str, str]) -> dict:
@@ -180,7 +242,8 @@ def main() -> int:
     args = parser.parse_args()
 
     keys = {app: secrets.token_hex(16) for app in ("mi-budget", "mi-burst", "mi-rate", "mi-stream")}
-    write_test_setup(keys)
+    admin_key, dashboard_password = secrets.token_hex(16), secrets.token_urlsafe(12)
+    write_test_setup(keys, admin_key, dashboard_password)
     report: dict = {}
     try:
         compose("down", "-v", check=False)
@@ -190,6 +253,7 @@ def main() -> int:
         report["budget"] = check_budget(keys)
         report["rate_limit"] = check_rate_limit(keys)
         report["cooldown_and_breaker"] = check_cooldown_and_breaker(keys)
+        report["https"] = check_https(keys, admin_key, dashboard_password)
         report["proxy_stream"] = check_proxy_stream(keys)
         report["restart"] = check_restart(keys)
         connections = int(psql("SELECT count(*) FROM pg_stat_activity WHERE datname = 'gateway'") or 0)

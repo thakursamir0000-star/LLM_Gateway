@@ -65,7 +65,7 @@ services:
       GATEWAY_HOST: 0.0.0.0
       GATEWAY_PORT: 8000
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"  # loopback only: external traffic goes through the HTTPS proxy
     depends_on:
       postgres:
         condition: service_healthy
@@ -93,7 +93,7 @@ services:
       GATEWAY_HOST: 0.0.0.0
       GATEWAY_PORT: 8001
     ports:
-      - "8001:8001"
+      - "127.0.0.1:8001:8001"
     depends_on:
       postgres:
         condition: service_healthy
@@ -111,7 +111,8 @@ services:
 
   dashboard:
     <<: *image
-    command: ["streamlit", "run", "dashboard/app.py", "--server.address=0.0.0.0", "--server.port=8501", "--server.headless=true"]
+    command: ["streamlit", "run", "dashboard/app.py", "--server.address=0.0.0.0", "--server.port=8501", "--server.headless=true",
+              "--server.baseUrlPath=dashboard"]  # served under /dashboard/ (also through the proxy)
     environment:
       GATEWAY_DATABASE_URL: postgresql+psycopg://gateway:gateway_local_password@postgres:5432/gateway
     ports:
@@ -122,7 +123,7 @@ services:
       gateway:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8501/_stcore/health', timeout=4)"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8501/dashboard/_stcore/health', timeout=4)"]
       interval: 30s
       timeout: 5s
       start_period: 20s
@@ -133,10 +134,15 @@ services:
     profiles:
       - proxy
     ports:
-      - "80:80"
+      - "80:80"    # redirects to HTTPS
+      - "443:443"
     volumes:
       - ./config/nginx.conf:/etc/nginx/nginx.conf:ro
+      # server.crt, server.key and dashboard.htpasswd (scripts/make_proxy_secrets.py makes development ones)
+      - ${GATEWAY_TLS_DIR:-./config/tls}:/etc/nginx/tls:ro
     depends_on:
+      dashboard:
+        condition: service_started
       gateway:
         condition: service_healthy
       gateway-replica:
