@@ -805,6 +805,8 @@ tests/              pytest suite
 
 ## Production deployment prerequisites
 
+The step-by-step deployment, upgrade, incident and key-rotation procedures are in [docs/RUNBOOK.md](docs/RUNBOOK.md).
+
 Not met by the repository alone: provide them before exposing the gateway.
 
 - `GATEWAY_ENV=production` with PostgreSQL, Redis (`noeviction`), client keys and an admin key; start-up refuses less.
