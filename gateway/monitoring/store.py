@@ -147,6 +147,8 @@ REQUESTS = Table(
     Column("error_type", Text),
     Column("error_message", Text),
     Column("stream", Integer, nullable=False, server_default="0"),
+    Column("shadow_score", Float),
+    Column("shadow_tier", Text),
 )
 Index("requests_ts", REQUESTS.c.ts)
 Index("requests_day_app", REQUESTS.c.day, REQUESTS.c.app_id)
@@ -235,7 +237,8 @@ INDEX_DDL = (
 )
 
 # Columns added after the first release, created on older databases at startup.
-MIGRATIONS = {"requests": {"latency_class": "TEXT"}, "alerts": {"dedup_key": "TEXT"}}
+MIGRATIONS = {"requests": {"latency_class": "TEXT", "shadow_score": "REAL", "shadow_tier": "TEXT"},
+              "alerts": {"dedup_key": "TEXT"}}
 
 
 def utc_now() -> datetime:
@@ -293,6 +296,8 @@ class RequestRecord:
     error_type: str | None = None
     error_message: str | None = None
     stream: bool = False
+    shadow_score: float | None = None  # the shadow router's P(cheap ok), not acted on
+    shadow_tier: str | None = None  # the tier the shadow router would have chosen
     calls: list[CallRecord] = field(default_factory=list)
 
     @property

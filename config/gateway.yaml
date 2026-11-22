@@ -128,6 +128,8 @@ routing:
   router: classifier      # rules | classifier (falls back to rules until a model is trained)
   classifier_path: models/router.json
   classifier_threshold: 0.955
+  shadow: false           # log what the classifier would choose, without acting (docs: README, shadow mode)
+  classifier_share: 1.0   # share of router-mode requests the classifier routes; the rest are a strong-tier control group
   threshold: 0.5
   fallback_on_error: true # chosen model, same tier on the other provider, then both other-tier models
 

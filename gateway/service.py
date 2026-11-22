@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import random
@@ -62,6 +63,15 @@ log = logging.getLogger("gateway")
 # `model` values that select a routing mode (None = the configured default).
 MODE_ALIASES: dict[str, str | None] = {"auto": None, "gateway": None, "": None, "router": "router",
                                        "cascade": "cascade", "cheap": "cheap", "strong": "strong"}
+
+
+def in_share(request_id: str, share: float) -> bool:
+    """Whether ``request_id`` falls in the first ``share`` of a uniform hash space (stable per id)."""
+    if share >= 1:
+        return True
+    if share <= 0:
+        return False
+    return int(hashlib.sha256(request_id.encode()).hexdigest()[:8], 16) / 0x100000000 < share
 
 
 class GatewayError(Exception):
@@ -289,6 +299,51 @@ class Gateway:
             return events, headers
         return self._holding_lease(events, ctx.app_id, lease), headers
 
+    async def _choose_tier(self, record: RequestRecord, mode: str, pinned: str | None, release: Release,
+                           release_name: str, latency: str, threshold: float, classifier: bool,
+                           app_messages: list[dict[str, Any]], notes: list[str]) -> str:
+        """The tier that answers, and in shadow mode what the trained classifier would have chosen.
+
+        With ``routing.classifier_share`` below 1, the classifier routes only that share of router-mode requests
+        (a hash of the request id decides, so a retry with the same id lands in the same group); the rest form a
+        control group answered by the strong tier. The classifier is only trusted for the model pair it was
+        trained on: another pair is sent to the strong tier and never shadow-scored.
+        """
+        expected = (release.model_for("cheap", latency), release.model_for("strong", latency))
+        trained = getattr(self.router, "model_aliases", None)
+        if pinned:
+            tier = "pinned"
+        elif mode == "router":
+            share = self.config.routing.classifier_share
+            if classifier and trained != expected:
+                record.router = self.router.name
+                notes.append(
+                    f"classifier trained for {trained}; release {release_name} {latency} uses {expected}: strong model"
+                )
+                tier = "strong"
+            elif classifier and not in_share(record.id, share):
+                record.router = "control"
+                notes.append(f"control group (the classifier routes {share:.0%} of requests): strong model")
+                tier = "strong"
+            else:
+                t = time.perf_counter()
+                score = self.router.score(app_messages)
+                record.router_ms = round((time.perf_counter() - t) * 1000, 3)
+                record.router, record.route_score = score.router, score.score
+                notes.append(score.reason)
+                tier = choose_tier(score.score, threshold)
+        else:
+            tier = "cheap" if mode == "cascade" else mode
+        if (self.config.routing.shadow and not pinned and self.router.name == "classifier"
+                and record.router != "classifier" and trained == expected):
+            try:
+                shadow = await asyncio.to_thread(self.router.score, app_messages)
+                record.shadow_score = shadow.score
+                record.shadow_tier = choose_tier(shadow.score, self.config.routing.classifier_threshold)
+            except Exception:  # shadow scoring must never fail a request
+                log.exception("shadow routing failed for request %s", record.id)
+        return tier
+
     async def _holding_lease(self, events: AsyncIterator[str], app_id: str, lease: str) -> AsyncIterator[str]:
         """Pass a started stream's events through, holding the client's concurrency slot until it ends
         (finished, failed or abandoned by a disconnected client)."""
@@ -365,26 +420,8 @@ class Gateway:
                              else self.config.routing.threshold)
         threshold = default_threshold if ctx.threshold is None else ctx.threshold
         record.mode, record.threshold, record.latency_class = ("pinned" if pinned else mode), threshold, latency
-        if pinned:
-            tier = "pinned"
-        elif mode == "router":
-            expected = (release.model_for("cheap", latency), release.model_for("strong", latency))
-            trained = getattr(self.router, "model_aliases", None)
-            if classifier and trained != expected:
-                record.router = self.router.name
-                notes.append(
-                    f"classifier trained for {trained}; release {release_name} {latency} uses {expected}: strong model"
-                )
-                tier = "strong"
-            else:
-                t = time.perf_counter()
-                score = self.router.score(app_messages)
-                record.router_ms = round((time.perf_counter() - t) * 1000, 3)
-                record.router, record.route_score = score.router, score.score
-                notes.append(score.reason)
-                tier = choose_tier(score.score, threshold)
-        else:
-            tier = "cheap" if mode == "cascade" else mode
+        tier = await self._choose_tier(record, mode, pinned, release, release_name, latency, threshold, classifier,
+                                       app_messages, notes)
         alias = pinned or release.model_for(tier, latency)
         params = request.params()
 
@@ -647,26 +684,8 @@ class Gateway:
                              else self.config.routing.threshold)
         threshold = default_threshold if ctx.threshold is None else ctx.threshold
         record.mode, record.threshold, record.latency_class = ("pinned" if pinned else mode), threshold, latency
-        if pinned:
-            tier = "pinned"
-        elif mode == "router":
-            expected = (release.model_for("cheap", latency), release.model_for("strong", latency))
-            trained = getattr(self.router, "model_aliases", None)
-            if classifier and trained != expected:
-                record.router = self.router.name
-                notes.append(
-                    f"classifier trained for {trained}; release {release_name} {latency} uses {expected}: strong model"
-                )
-                tier = "strong"
-            else:
-                t = time.perf_counter()
-                score = self.router.score(app_messages)
-                record.router_ms = round((time.perf_counter() - t) * 1000, 3)
-                record.router, record.route_score = score.router, score.score
-                notes.append(score.reason)
-                tier = choose_tier(score.score, threshold)
-        else:
-            tier = "cheap" if mode == "cascade" else mode
+        tier = await self._choose_tier(record, mode, pinned, release, release_name, latency, threshold, classifier,
+                                       app_messages, notes)
         alias = pinned or release.model_for(tier, latency)
         params = request.params()
 

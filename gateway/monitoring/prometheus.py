@@ -95,6 +95,12 @@ class Metrics:
                                        ("model",))
         self.fallbacks = Counter("gateway_fallbacks_total", "Requests answered by a fallback model.", ("app",))
         self.escalations = Counter("gateway_escalations_total", "Cascade escalations to the strong tier.", ("app",))
+        self.router_decisions = Counter("gateway_router_decisions_total",
+                                        "Router-mode requests by who decided (classifier, rules, control) and tier.",
+                                        ("router", "tier"))
+        self.shadow = Counter("gateway_shadow_decisions_total",
+                              "Shadow-scored requests: the tier used and the tier the classifier would have chosen.",
+                              ("tier", "shadow_tier"))
 
     def _app(self, app_id: str) -> str:
         if app_id in self._apps:
@@ -115,6 +121,10 @@ class Metrics:
                 self.fallbacks.inc((app,))
             if record.escalated:
                 self.escalations.inc((app,))
+            if record.mode == "router" and record.router:
+                self.router_decisions.inc((record.router, record.tier or ""))
+            if record.shadow_tier:
+                self.shadow.inc((record.tier or "", record.shadow_tier))
             for call in record.calls:
                 model = call.model or ""
                 self.calls.inc((model, call.status, call.error_type or ""))
@@ -140,6 +150,6 @@ class Metrics:
                           "# TYPE gateway_state_degraded gauge",
                           f'gateway_state_degraded{{backend="{backend}"}} {1 if state_status.get("degraded") else 0}']
             for metric in (self.requests, self.duration, self.tokens, self.cost, self.calls, self.call_duration,
-                           self.fallbacks, self.escalations):
+                           self.fallbacks, self.escalations, self.router_decisions, self.shadow):
                 lines.extend(metric.render())
             return "\n".join(lines) + "\n"

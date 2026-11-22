@@ -37,7 +37,8 @@ See [Validation status](#validation-status).
 | Gemini API adapter | yes | yes (mocked HTTP) | – | no | no |
 | Retries, fallback, quota cooldowns, circuit breakers | yes | yes | yes: shared across two replicas through Redis | fallback only: Groq 401 → OpenRouter in the smoke test | no |
 | Rules router, cascade | yes | yes | – | no | no |
-| Trained classifier router | yes, **not active** | yes | offline held-out evaluation | on real benchmark answers, offline | no |
+| Trained classifier router (v1; v2 evaluated and not promoted) | yes, **not active** | yes | offline held-out evaluation | on real benchmark answers, offline | no |
+| Router shadow mode and controlled activation (classifier share, control group) | yes, **off** | yes | – | – | no |
 | Per-app budgets with atomic reservations | yes | yes | yes: PostgreSQL 16, two replicas | no | no |
 | Request log, metrics, alerts | yes | yes | yes: PostgreSQL 16 | no | no |
 | Releases, canary, rollback | yes | yes | yes: PostgreSQL 16, concurrent changes | – | no |
@@ -432,6 +433,31 @@ Phase 1 security hardening enforces production-safe defaults:
   count of every table and the Alembic revision, and drops the scratch database. Run it after every schema change
   and on a schedule; it passed on the Compose PostgreSQL 16 database (5 requests, revision 0003).
 
+## Router shadow mode and controlled activation
+
+The trained classifier is never switched on in one step. Three stages, each read with `scripts/router_report.py`
+(from the request log; `--json` to save it):
+
+1. **Shadow** (`routing.shadow: true`): every routable request is still answered as configured, and the classifier
+   is asked which tier it would have chosen; `requests.shadow_tier`/`shadow_score` and
+   `gateway_shadow_decisions_total` record it. The report gives agreement with the tier used, the share it would
+   send to the cheap model, and an estimated saving (strong answers it would have sent cheap, re-priced at the cheap
+   model's list price). It cannot tell whether those cheap answers would have been good enough: compare user
+   feedback per group, and sample requests for review.
+2. **Canary** (`default_mode: router` or `model="router"`, with `routing.classifier_share: 0.05`): the classifier
+   routes that share of router-mode requests, chosen by a hash of the request id; the rest are a control group
+   answered by the strong tier (and shadow-scored). The report compares the groups' error rate, cost, latency and
+   feedback. Raise the share in steps (0.05, 0.25, 1.0) only when the classifier group is no worse.
+3. **Rollback** at any stage: `classifier_share: 0` (or `routing.router: rules`) and a rolling restart.
+
+Only the model pair the classifier was trained for is ever routed or shadow-scored by it; with the shipped config
+that is the OpenRouter batch pair. The shipped config keeps shadow off and `default_mode: strong`, and
+`models/router.json` is not installed: turning any of this on is a deployment decision.
+
+Retraining from feedback (Phase 6.6) is not built. The request log stores no prompt text, by design, so thumbs-up
+or thumbs-down ratings can't be joined to the questions they rate. A retraining set would need an opt-in prompt
+capture with its own retention and consent, and enough rated traffic to beat the 900 benchmark questions.
+
 ## Router lab: data, training, evaluation
 
 The router is trained on which questions the cheap model gets right. The OpenRouter collection and held-out
@@ -521,6 +547,14 @@ training scores and mirrored by `routing.classifier_threshold`. A mismatch preve
 
 The rules baseline selected a threshold that sent every held-out question to the strong model. The cascade also
 escalated every question and cost 83% more than always-strong, so neither improved this OpenRouter pair.
+
+### Router v2 (2026-11-22, offline)
+
+A second classifier, MiniLM embeddings plus hashed word and word-pair features, trained and evaluated exactly like
+v1, scored better in cross-validation (out-of-fold AUC 0.648 vs 0.638) but not on the held-out questions: 87.0%
+accuracy with a 12% saving (v1: 88.0%, 8%), only 0.3 points above random routing at its strong share, and not
+significantly different from always-strong (p = 0.125). v1 stays the candidate. Details:
+[`results/router_v2.md`](results/router_v2.md).
 
 ### Load test (measured 2026-11-22, fake providers)
 

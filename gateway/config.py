@@ -106,6 +106,12 @@ class RoutingConfig(_Strict):
     classifier_threshold: float = Field(0.5, ge=0, le=1)
     threshold: float = Field(0.5, ge=0, le=1)
     fallback_on_error: bool = True
+    # Shadow mode: score every routable request with the trained classifier and log what it would choose
+    # (requests.shadow_tier/shadow_score), without acting on it. Needs a loaded classifier.
+    shadow: bool = False
+    # Controlled activation: the share of router-mode requests the classifier routes, picked by a hash of the
+    # request id; the rest go to the strong tier as the control group (and are shadow-scored).
+    classifier_share: float = Field(1.0, ge=0, le=1)
 
 
 class RetryConfig(_Strict):
