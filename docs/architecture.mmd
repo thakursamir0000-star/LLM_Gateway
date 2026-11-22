@@ -1,0 +1,69 @@
+%% LLM Gateway architecture: the request path as implemented in gateway/app.py, gateway/service.py and
+%% gateway/providers/__init__.py. Rendered in README.md (GitHub renders Mermaid natively).
+%% Dashed boxes are implemented but off in the shipped config.
+flowchart TB
+    Client["Client application<br/>(OpenAI SDK or curl)"]
+
+    subgraph Edge["Edge (Compose profile: proxy)"]
+        Proxy["nginx HTTPS proxy<br/>TLS 1.2/1.3, security headers<br/>/admin and /metrics blocked"]
+    end
+
+    subgraph GW["FastAPI gateway (2 replicas, stateless)"]
+        direction TB
+        Limits["Body size limit<br/>+ request schema validation"]
+        Auth["API key authentication<br/>hashed keys, constant-time"]
+        ClientRL["Per-client limits<br/>requests/min, in flight"]
+        Budget["Daily budget<br/>atomic cost reservation"]
+        Release["Release + canary<br/>model pair, prompt version"]
+        Route["Routing engine<br/>auto / cheap / strong / cascade / router<br/>latency class picks the provider"]
+        Shadow["Shadow scoring +<br/>classifier share (control group)"]:::off
+        Registry["Model registry<br/>cooldowns, circuit breakers,<br/>provider rate limits, retries"]
+        Fallback["Fallback chain<br/>same tier other provider,<br/>then other tier"]
+        Respond["Response<br/>JSON or SSE stream"]
+        Finish["Finish: request log,<br/>metrics, JSON access log"]
+    end
+
+    subgraph Providers["LLM providers"]
+        Groq["Groq<br/>gpt-oss-20b / 120b<br/>(interactive)"]
+        OR["OpenRouter<br/>gpt-oss-20b / 120b<br/>(batch)"]
+        Gemini["Gemini API<br/>Gemini / Gemma"]
+    end
+
+    subgraph State["Shared state"]
+        Redis[("Redis 7<br/>client limits, rate limits,<br/>cooldowns, circuit breakers")]
+        PG[("PostgreSQL 16<br/>requests, calls, budgets,<br/>releases, feedback, alerts")]
+    end
+
+    subgraph Obs["Observability (Compose profile: monitoring)"]
+        Prom["Prometheus<br/>scrapes /metrics, 4 alert rules"]
+        Grafana["Grafana<br/>LLM Gateway dashboard"]
+        Dash["Streamlit dashboard<br/>(reads the request log)"]
+    end
+
+    subgraph Lab["Router lab (offline, no live traffic)"]
+        Bench["GSM8K + MMLU<br/>1,200 questions"] --> Labels["collect_labels.py<br/>cheap vs strong answers"]
+        Labels --> Train["train_router.py<br/>MiniLM embedding + logistic regression"]
+        Train --> Artifact["router.json<br/>(not installed)"]:::off
+        Train --> Eval["evaluate_router.py<br/>300 held-out questions"]
+    end
+
+    Client -->|"HTTPS"| Proxy --> Limits
+    Client -.->|"loopback / development"| Limits
+    Limits --> Auth --> ClientRL --> Budget --> Release --> Route
+    Route -.-> Shadow
+    Route --> Registry --> Groq & OR & Gemini
+    Registry --> Fallback --> Registry
+    Groq & OR & Gemini --> Respond --> Client
+    Respond --> Finish
+
+    ClientRL <--> Redis
+    Registry <--> Redis
+    Budget <--> PG
+    Release <--> PG
+    Finish --> PG
+    Prom -->|"scrapes /metrics"| Finish
+    Prom --> Grafana
+    PG --> Dash
+    Artifact -.->|"after approval only"| Route
+
+    classDef off stroke-dasharray: 5 5
